@@ -3,12 +3,14 @@ on:
   push:
     paths:
       - "crystal_geometry.py"
+      - "restricted_exec.py"
       - "tests/**"
       - "examples/**"
       - ".github/workflows/tests.yml"
   pull_request:
     paths:
       - "crystal_geometry.py"
+      - "restricted_exec.py"
       - "tests/**"
       - "examples/**"
       - ".github/workflows/tests.yml"
@@ -25,15 +27,133 @@ jobs:
           persist-credentials: false
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
-      - name: Example calculation
+      - name: Restricted Docker execution
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p out
-          python3 crystal_geometry.py examples/cells.json > out/example-results.json
-          python3 -m json.tool out/example-results.json > /dev/null
-      - name: Upload example result
+          image="python:3.12-alpine"
+          docker pull "$image" >/dev/null
+          probe="restricted-net-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          candidate="restricted-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker rm -f "$probe" "$candidate" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker create --name "$probe" \
+            --network none --read-only \
+            --security-opt no-new-privileges:true --cap-drop ALL \
+            --pids-limit 32 --memory 128m --cpus 0.5 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            "$image" python3 -B -c \
+            'import os,socket; assert not any(k.startswith(("GITHUB_","ACTIONS_","RUNNER_")) for k in os.environ); routes=open("/proc/net/route",encoding="ascii").read().splitlines()[1:]; assert not any(line.split()[1]=="00000000" for line in routes if len(line.split())>1); s=socket.socket(); s.settimeout(1); ok=False
+          try:
+              s.connect(("1.1.1.1",53))
+          except OSError:
+              ok=True
+          finally:
+              s.close()
+          raise SystemExit(0 if ok else 20)' >/dev/null
+          test "$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$probe")" = "none"
+          docker start -a "$probe" >/dev/null 2>&1
+          docker rm "$probe" >/dev/null
+
+          docker create --name "$candidate" \
+            --network none --read-only \
+            --security-opt no-new-privileges:true --cap-drop ALL \
+            --pids-limit 32 --memory 128m --cpus 0.5 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --mount type=bind,src="$PWD/crystal_geometry.py",dst=/app/crystal_geometry.py,readonly \
+            --mount type=bind,src="$PWD/examples/cells.json",dst=/input/cells.json,readonly \
+            --workdir /app \
+            "$image" python3 -B /app/crystal_geometry.py /input/cells.json >/dev/null
+
+          python3 - "$candidate" "$PWD/crystal_geometry.py" "$PWD/examples/cells.json" <<'PY'
+          import json, os, subprocess, sys
+          cfg=json.loads(subprocess.check_output(["docker","inspect",sys.argv[1]], text=True))[0]
+          host=cfg["HostConfig"]
+          assert host["NetworkMode"]=="none"
+          assert host["ReadonlyRootfs"] is True
+          assert host["PidsLimit"]==32
+          assert host["Memory"]==134217728
+          assert host["NanoCpus"]==500000000
+          assert "ALL" in (host.get("CapDrop") or [])
+          assert any(x.startswith("no-new-privileges") for x in (host.get("SecurityOpt") or []))
+          allowed={(os.path.realpath(sys.argv[2]),"/app/crystal_geometry.py"),(os.path.realpath(sys.argv[3]),"/input/cells.json")}
+          mounts=cfg.get("Mounts") or []
+          assert len(mounts)==2
+          assert {(os.path.realpath(m["Source"]),m["Destination"]) for m in mounts}==allowed
+          assert all(not m["RW"] for m in mounts)
+          env=cfg.get("Config",{}).get("Env") or []
+          assert not any(item.split("=",1)[0].startswith(("GITHUB_","ACTIONS_","RUNNER_")) for item in env)
+          PY
+
+          python3 restricted_exec.py \
+            --timeout 10 --max-output 65536 \
+            --stdout-file out/plain.json --status-file out/internal-status.json -- \
+            /usr/bin/docker start -a "$candidate"
+          python3 -m json.tool out/plain.json >/dev/null
+          docker rm "$candidate" >/dev/null
+          trap - EXIT
+      - name: AES-GCM CMS round trip
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f out/plain.json
+          openssl version | grep -q '^OpenSSL 3\.'
+          openssl list -cipher-algorithms | grep -q 'AES-256-GCM'
+          keydir="$(mktemp -d)"
+          cleanup() {
+            rm -rf "$keydir"
+            rm -f out/plain.json out/internal-status.json
+          }
+          trap cleanup EXIT
+
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -subj /CN=restricted-output-ephemeral \
+            -keyout "$keydir/key.pem" -out "$keydir/cert.pem" -days 1 >/dev/null 2>&1
+          mkdir -p out/publish
+          openssl cms -encrypt -binary -in out/plain.json \
+            -out out/publish/result.cms.der -outform DER \
+            -aes-256-gcm "$keydir/cert.pem" >/dev/null 2>&1
+          openssl cms -cmsout -print -inform DER -in out/publish/result.cms.der 2>/dev/null | grep -qi 'aes-256-gcm'
+
+          openssl cms -decrypt -binary -in out/publish/result.cms.der -inform DER \
+            -recip "$keydir/cert.pem" -inkey "$keydir/key.pem" \
+            -out "$keydir/roundtrip.tmp" >/dev/null 2>&1
+          cmp out/plain.json "$keydir/roundtrip.tmp"
+
+          python3 - out/publish/result.cms.der "$keydir/tampered.der" <<'PY'
+          from pathlib import Path
+          import sys
+          data=bytearray(Path(sys.argv[1]).read_bytes())
+          if not data:
+              raise SystemExit(2)
+          data[-1] ^= 1
+          Path(sys.argv[2]).write_bytes(data)
+          PY
+          set +e
+          openssl cms -decrypt -binary -in "$keydir/tampered.der" -inform DER \
+            -recip "$keydir/cert.pem" -inkey "$keydir/key.pem" \
+            -out "$keydir/rejected.tmp" >/dev/null 2>&1
+          tamper_rc=$?
+          set -e
+          test "$tamper_rc" -ne 0
+          rm -f "$keydir/rejected.tmp"
+          test ! -e "$keydir/rejected.tmp"
+
+          cat > out/publish/status.json <<'JSON'
+          {"schema":"restricted-output-test/1","scope":"public synthetic geometry only","network_mode":"none","read_only_root":true,"no_new_privileges":true,"cap_drop_all":true,"pids_limit":32,"memory_bytes":134217728,"cpu_limit":0.5,"timeout_seconds":10,"max_output_bytes_per_stream":65536,"cms_cipher":"AES-256-GCM","roundtrip_verified":true,"tamper_rejected":true}
+          JSON
+          python3 -m json.tool out/publish/status.json >/dev/null
+      - name: Upload encrypted synthetic result
         uses: actions/upload-artifact@v7
         with:
-          name: "example-${{ github.run_id }}-${{ github.run_attempt }}"
-          path: out/example-results.json
+          name: "restricted-output-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: |
+            out/publish/result.cms.der
+            out/publish/status.json
           if-no-files-found: error
           retention-days: 14
+          overwrite: false
