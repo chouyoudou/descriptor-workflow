@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from restricted_exec import run_bounded
+from restricted_exec import MAX_TIMEOUT_SECONDS, run_bounded
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -41,6 +41,24 @@ class RestrictedExecutionTests(unittest.TestCase):
             max_output_bytes=4096,
         )
         self.assertTrue(result.timed_out)
+
+    def test_engineering_timeout_budget_accepts_30_minutes_without_waiting(self):
+        result = run_bounded(
+            [sys.executable, "-c", "pass"],
+            timeout_seconds=MAX_TIMEOUT_SECONDS,
+            max_output_bytes=4096,
+        )
+        self.assertEqual(MAX_TIMEOUT_SECONDS, 1800)
+        self.assertEqual(result.child_exit_code, 0)
+        self.assertFalse(result.timed_out)
+
+    def test_timeout_above_engineering_budget_is_rejected(self):
+        with self.assertRaises(ValueError):
+            run_bounded(
+                [sys.executable, "-c", "pass"],
+                timeout_seconds=MAX_TIMEOUT_SECONDS + 0.001,
+                max_output_bytes=4096,
+            )
 
     def test_geometry_output_remains_usable(self):
         with tempfile.TemporaryDirectory() as tmp:

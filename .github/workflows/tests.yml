@@ -20,24 +20,53 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
-      - name: Restricted Docker execution
+      - name: Restricted Docker output lifecycle
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out
-          image="python:3.12-alpine"
-          docker pull "$image" >/dev/null
+          mkdir -p out/restricted-lifecycle
+          image_tag="python:3.12-slim-bookworm"
+          docker pull --platform linux/amd64 "$image_tag" >/dev/null
+          runtime_image="$(docker image inspect --format '{{index .RepoDigests 0}}' "$image_tag")"
+          case "$runtime_image" in
+            python@sha256:*) ;;
+            *) echo "IMAGE_STAGE=immutable-digest EXIT=1"; exit 2 ;;
+          esac
+          test "$(docker image inspect --format '{{.Os}}' "$runtime_image")" = "linux"
+          test "$(docker image inspect --format '{{.Architecture}}' "$runtime_image")" = "amd64"
+          pyver="$(docker run --rm --network none --read-only \
+            --security-opt no-new-privileges:true --cap-drop ALL \
+            "$runtime_image" python3 -c 'import platform; print(platform.python_version())')"
+          case "$pyver" in 3.12.*) ;; *) echo "IMAGE_STAGE=python312 EXIT=1"; exit 3 ;; esac
+          glibc="$(docker run --rm --network none --read-only \
+            --security-opt no-new-privileges:true --cap-drop ALL \
+            "$runtime_image" getconf GNU_LIBC_VERSION)"
+          case "$glibc" in glibc\ *) ;; *) echo "IMAGE_STAGE=glibc EXIT=1"; exit 4 ;; esac
+          printf 'IMAGE_STAGE=verified EXIT=0 IMAGE=%s PYTHON=%s GLIBC=%s\n' \
+            "$runtime_image" "$pyver" "$glibc"
+
+          base="$RUNNER_TEMP/restricted-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          success_dir="$base/success"
+          fail_dir="$base/failure"
+          timeout_dir="$base/timeout"
           probe="restricted-net-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          candidate="restricted-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          candidate="restricted-out-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          failing="restricted-fail-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          timing="restricted-timeout-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$base"
+          install -d -m 0700 "$base" "$success_dir" "$fail_dir" "$timeout_dir"
           cleanup() {
-            docker rm -f "$probe" "$candidate" >/dev/null 2>&1 || true
+            docker rm -f "$probe" "$candidate" "$failing" "$timing" >/dev/null 2>&1 || true
+            rm -rf "$base"
+            rm -f out/restricted-lifecycle/*.internal-status.json \
+              out/restricted-lifecycle/*.captured
           }
           trap cleanup EXIT
 
@@ -45,8 +74,8 @@ jobs:
             --network none --read-only \
             --security-opt no-new-privileges:true --cap-drop ALL \
             --pids-limit 32 --memory 128m --cpus 0.5 \
-            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
-            "$image" python3 -B -c \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777 \
+            "$runtime_image" python3 -B -c \
             'import os,socket; assert not any(k.startswith(("GITHUB_","ACTIONS_","RUNNER_")) for k in os.environ); routes=open("/proc/net/route",encoding="ascii").read().splitlines()[1:]; assert not any(line.split()[1]=="00000000" for line in routes if len(line.split())>1); s=socket.socket(); s.settimeout(1); ok=False
           try:
               s.connect(("1.1.1.1",53))
@@ -59,17 +88,20 @@ jobs:
           docker start -a "$probe" >/dev/null 2>&1
           docker rm "$probe" >/dev/null
 
+          uid="$(id -u)"; gid="$(id -g)"
           docker create --name "$candidate" \
-            --network none --read-only \
+            --network none --read-only --user "$uid:$gid" \
             --security-opt no-new-privileges:true --cap-drop ALL \
             --pids-limit 32 --memory 128m --cpus 0.5 \
-            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777 \
             --mount type=bind,src="$PWD/crystal_geometry.py",dst=/app/crystal_geometry.py,readonly \
             --mount type=bind,src="$PWD/examples/cells.json",dst=/input/cells.json,readonly \
+            --mount type=bind,src="$success_dir",dst=/output \
             --workdir /app \
-            "$image" python3 -B /app/crystal_geometry.py /input/cells.json >/dev/null
+            "$runtime_image" /bin/sh -c \
+            'python3 -B /app/crystal_geometry.py /input/cells.json > /output/result.json' >/dev/null
 
-          python3 - "$candidate" "$PWD/crystal_geometry.py" "$PWD/examples/cells.json" <<'PY'
+          python3 - "$candidate" "$PWD/crystal_geometry.py" "$PWD/examples/cells.json" "$success_dir" <<'PY'
           import json, os, subprocess, sys
           cfg=json.loads(subprocess.check_output(["docker","inspect",sys.argv[1]], text=True))[0]
           host=cfg["HostConfig"]
@@ -80,106 +112,132 @@ jobs:
           assert host["NanoCpus"]==500000000
           assert "ALL" in (host.get("CapDrop") or [])
           assert any(x.startswith("no-new-privileges") for x in (host.get("SecurityOpt") or []))
-          allowed={(os.path.realpath(sys.argv[2]),"/app/crystal_geometry.py"),(os.path.realpath(sys.argv[3]),"/input/cells.json")}
+          allowed={
+              (os.path.realpath(sys.argv[2]),"/app/crystal_geometry.py",False),
+              (os.path.realpath(sys.argv[3]),"/input/cells.json",False),
+              (os.path.realpath(sys.argv[4]),"/output",True),
+          }
           mounts=cfg.get("Mounts") or []
-          assert len(mounts)==2
-          assert {(os.path.realpath(m["Source"]),m["Destination"]) for m in mounts}==allowed
-          assert all(not m["RW"] for m in mounts)
+          assert len(mounts)==3
+          observed={(os.path.realpath(m["Source"]),m["Destination"],bool(m["RW"])) for m in mounts}
+          assert observed==allowed
+          assert not any(m["Destination"] in {"/var/run/docker.sock","/root","/home"} for m in mounts)
           env=cfg.get("Config",{}).get("Env") or []
           assert not any(item.split("=",1)[0].startswith(("GITHUB_","ACTIONS_","RUNNER_")) for item in env)
           PY
 
           python3 restricted_exec.py \
-            --timeout 10 --max-output 65536 \
-            --stdout-file out/plain.json --status-file out/internal-status.json -- \
+            --timeout 1800 --max-output 65536 \
+            --stdout-file out/restricted-lifecycle/success.captured \
+            --status-file out/restricted-lifecycle/success.internal-status.json -- \
             /usr/bin/docker start -a "$candidate"
-          python3 -m json.tool out/plain.json >/dev/null
+
+          python3 - "$success_dir" <<'PY'
+          import json, os, stat, sys
+          root=sys.argv[1]
+          names=os.listdir(root)
+          assert names==["result.json"], names
+          path=os.path.join(root,"result.json")
+          st=os.lstat(path)
+          assert stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+          assert st.st_nlink==1 and 0 < st.st_size <= 1048576
+          data=json.load(open(path,encoding="utf-8"))
+          assert [row["id"] for row in data]==["cubic","orthorhombic","skew"]
+          PY
+          cp "$success_dir/result.json" out/restricted-lifecycle/geometry-result.json
           docker rm "$candidate" >/dev/null
-          trap - EXIT
-      - name: AES-GCM CMS round trip
-        shell: bash
-        run: |
-          set -euo pipefail
-          keydir="$(mktemp -d)"
-          success=0
-          cleanup() {
-            rm -rf "$keydir"
-            rm -f out/plain.json out/internal-status.json
-            if [ "$success" -ne 1 ]; then
-              rm -f out/publish/result.cms.der out/publish/status.json
-            fi
-          }
-          trap cleanup EXIT
-          run_stage() {
-            local name="$1"
-            shift
-            set +e
-            "$@" >"$keydir/${name}.stdout" 2>"$keydir/${name}.stderr"
-            local rc=$?
-            set -e
-            printf 'CMS_STAGE=%s EXIT=%d\n' "$name" "$rc"
-            [ "$rc" -eq 0 ] || exit "$rc"
-          }
+          rm -rf "$success_dir"
+          test ! -e "$success_dir"
 
-          if [ -f out/plain.json ]; then
-            printf 'CMS_STAGE=input-present EXIT=0\n'
-          else
-            printf 'CMS_STAGE=input-present EXIT=1\n'
-            exit 1
-          fi
-          mkdir -p out/publish
-
-          run_stage cert openssl req -x509 -newkey rsa:2048 -nodes \
-            -subj /CN=restricted-output-ephemeral \
-            -keyout "$keydir/key.pem" -out "$keydir/cert.pem" -days 1
-          run_stage encrypt openssl cms -encrypt -binary -in out/plain.json \
-            -out out/publish/result.cms.der -outform DER \
-            -aes-256-gcm "$keydir/cert.pem"
-          run_stage inspect openssl cms -cmsout -print -inform DER \
-            -in out/publish/result.cms.der
-          run_stage cipher-confirm python3 -c \
-            'from pathlib import Path; import re,sys; text=Path(sys.argv[1]).read_text(errors="replace").lower(); pats=(r"aes-256-gcm",r"id-aes256-gcm",r"2\.16\.840\.1\.101\.3\.4\.1\.46"); sys.exit(0 if any(re.search(p,text) for p in pats) else 1)' \
-            "$keydir/inspect.stdout"
-          run_stage decrypt openssl cms -decrypt -binary \
-            -in out/publish/result.cms.der -inform DER \
-            -recip "$keydir/cert.pem" -inkey "$keydir/key.pem" \
-            -out "$keydir/roundtrip.tmp"
-          run_stage roundtrip-compare cmp -s out/plain.json "$keydir/roundtrip.tmp"
-          run_stage tamper-create python3 -c \
-            'from pathlib import Path; import sys; data=bytearray(Path(sys.argv[1]).read_bytes()); len(data) or sys.exit(2); data[-1] ^= 1; Path(sys.argv[2]).write_bytes(data)' \
-            out/publish/result.cms.der "$keydir/tampered.der"
-
+          docker create --name "$failing" \
+            --network none --read-only --user "$uid:$gid" \
+            --security-opt no-new-privileges:true --cap-drop ALL \
+            --pids-limit 32 --memory 128m --cpus 0.5 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777 \
+            --mount type=bind,src="$fail_dir",dst=/output \
+            "$runtime_image" /bin/sh -c 'printf partial > /output/partial.txt; exit 7' >/dev/null
           set +e
-          openssl cms -decrypt -binary -in "$keydir/tampered.der" -inform DER \
-            -recip "$keydir/cert.pem" -inkey "$keydir/key.pem" \
-            -out "$keydir/rejected.tmp" \
-            >"$keydir/tamper.stdout" 2>"$keydir/tamper.stderr"
-          tamper_rc=$?
+          python3 restricted_exec.py \
+            --timeout 10 --max-output 65536 \
+            --stdout-file out/restricted-lifecycle/failure.captured \
+            --status-file out/restricted-lifecycle/failure.internal-status.json -- \
+            /usr/bin/docker start -a "$failing"
+          fail_rc=$?
           set -e
-          printf 'CMS_STAGE=tamper-decrypt EXIT=%d\n' "$tamper_rc"
-          if [ "$tamper_rc" -eq 0 ]; then
-            exit 21
-          fi
-          rm -f "$keydir/rejected.tmp"
-          if [ -e "$keydir/rejected.tmp" ]; then
-            printf 'CMS_STAGE=tamper-reject EXIT=1\n'
-            exit 22
-          fi
-          printf 'CMS_STAGE=tamper-reject EXIT=0\n'
+          test "$fail_rc" -ne 0
+          python3 - <<'PY'
+          import json
+          s=json.load(open("out/restricted-lifecycle/failure.internal-status.json"))
+          assert not s["timed_out"] and s["child_exit_code"] not in (None,0)
+          PY
+          docker rm -f "$failing" >/dev/null 2>&1 || true
+          rm -rf "$fail_dir"
+          ! docker inspect "$failing" >/dev/null 2>&1
+          test ! -e "$fail_dir"
 
-          cat > out/publish/status.json <<'JSON'
-          {"schema":"restricted-output-test/1","scope":"public synthetic geometry only","network_mode":"none","read_only_root":true,"no_new_privileges":true,"cap_drop_all":true,"pids_limit":32,"memory_bytes":134217728,"cpu_limit":0.5,"timeout_seconds":10,"max_output_bytes_per_stream":65536,"cms_cipher":"AES-256-GCM","roundtrip_verified":true,"tamper_rejected":true}
-          JSON
-          run_stage status-validate python3 -m json.tool out/publish/status.json
-          success=1
-          printf 'CMS_STAGE=publish-ready EXIT=0\n'
-      - name: Upload encrypted synthetic result
-        uses: actions/upload-artifact@v7
+          docker create --name "$timing" \
+            --network none --read-only --user "$uid:$gid" \
+            --security-opt no-new-privileges:true --cap-drop ALL \
+            --pids-limit 32 --memory 128m --cpus 0.5 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777 \
+            --mount type=bind,src="$timeout_dir",dst=/output \
+            "$runtime_image" /bin/sh -c 'printf partial > /output/partial.txt; sleep 5' >/dev/null
+          set +e
+          python3 restricted_exec.py \
+            --timeout 0.3 --max-output 65536 \
+            --stdout-file out/restricted-lifecycle/timeout.captured \
+            --status-file out/restricted-lifecycle/timeout.internal-status.json -- \
+            /usr/bin/docker start -a "$timing"
+          timeout_rc=$?
+          set -e
+          test "$timeout_rc" -ne 0
+          python3 - <<'PY'
+          import json
+          s=json.load(open("out/restricted-lifecycle/timeout.internal-status.json"))
+          assert s["timed_out"] is True
+          PY
+          docker rm -f "$timing" >/dev/null 2>&1 || true
+          rm -rf "$timeout_dir"
+          ! docker inspect "$timing" >/dev/null 2>&1
+          test ! -e "$timeout_dir"
+
+          RUNTIME_IMAGE="$runtime_image" PYTHON_VERSION="$pyver" GLIBC_VERSION="$glibc" \
+          python3 - <<'PY'
+          import json, os
+          status={
+              "schema":"restricted-output-lifecycle-test/1",
+              "scope":"public synthetic geometry only",
+              "runtime_image":os.environ["RUNTIME_IMAGE"],
+              "runtime_os":"linux",
+              "runtime_arch":"amd64",
+              "python":os.environ["PYTHON_VERSION"],
+              "libc":os.environ["GLIBC_VERSION"],
+              "network_mode":"none",
+              "read_only_root":True,
+              "no_new_privileges":True,
+              "cap_drop_all":True,
+              "persistent_host_write_mounts":1,
+              "output_survived_container_exit":True,
+              "output_regular_file_verified":True,
+              "nonzero_failure_cleanup_verified":True,
+              "timeout_cleanup_verified":True,
+              "engineering_timeout_max_seconds":1800,
+              "max_output_bytes_per_stream":65536,
+          }
+          with open("out/restricted-lifecycle/status.json","w",encoding="utf-8") as f:
+              json.dump(status,f,sort_keys=True,separators=(",",":")); f.write("\n")
+          PY
+          rm -f out/restricted-lifecycle/*.internal-status.json out/restricted-lifecycle/*.captured
+          rm -rf "$base"
+          trap - EXIT
+          echo "RESTRICTED_STAGE=output-lifecycle-and-cleanup-ok"
+      - name: Upload public lifecycle evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: "restricted-output-${{ github.run_id }}-${{ github.run_attempt }}"
+          name: "restricted-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}"
           path: |
-            out/publish/result.cms.der
-            out/publish/status.json
+            out/restricted-lifecycle/geometry-result.json
+            out/restricted-lifecycle/status.json
           if-no-files-found: error
           retention-days: 14
           overwrite: false

@@ -10,6 +10,9 @@ from pathlib import Path
 import subprocess
 import threading
 
+MAX_TIMEOUT_SECONDS = 30 * 60
+MAX_CAPTURE_BYTES = 1_048_576
+
 
 @dataclass
 class ExecutionResult:
@@ -35,10 +38,10 @@ class ExecutionResult:
 def run_bounded(command: list[str], *, timeout_seconds: float, max_output_bytes: int) -> ExecutionResult:
     if not command:
         raise ValueError("command is required")
-    if not 0 < timeout_seconds <= 60:
-        raise ValueError("timeout_seconds must be in (0, 60]")
-    if not 1024 <= max_output_bytes <= 1_048_576:
-        raise ValueError("max_output_bytes must be between 1024 and 1048576")
+    if not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
+        raise ValueError(f"timeout_seconds must be in (0, {MAX_TIMEOUT_SECONDS}]")
+    if not 1024 <= max_output_bytes <= MAX_CAPTURE_BYTES:
+        raise ValueError(f"max_output_bytes must be between 1024 and {MAX_CAPTURE_BYTES}")
 
     proc = subprocess.Popen(
         command,
