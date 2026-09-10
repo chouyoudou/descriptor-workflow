@@ -1,0 +1,7 @@
+# Public scientific runtime roots for the local-environment dependency smoke test.
+# The workflow resolves and hashes the complete exact transitive lock before caching.
+matminer==0.10.1
+pymatgen==2026.5.4
+numpy==2.5.3
+scipy==1.18.1
+spglib==2.7.0

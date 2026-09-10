@@ -1,0 +1,239 @@
+name: Public scientific dependency cache
+on:
+  push:
+    branches: [main]
+    paths:
+      - "public_env/**"
+      - ".github/workflows/public-deps.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  PUBLIC_WHEELHOUSE_BUILD: v1
+  PUBLIC_PYTHON_ABI: cp312
+jobs:
+  build-wheelhouse:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      lock_sha: ${{ steps.resolve.outputs.lock_sha }}
+      resolve_ms: ${{ steps.resolve.outputs.elapsed_ms }}
+      first_cache_hit: ${{ steps.wheels.outputs.cache-hit }}
+      restore_ms: ${{ steps.restore_time.outputs.elapsed_ms }}
+      download_ms: ${{ steps.download.outputs.elapsed_ms }}
+      install_ms: ${{ steps.install.outputs.elapsed_ms }}
+      wheel_count: ${{ steps.manifest.outputs.wheel_count }}
+      wheel_bytes: ${{ steps.manifest.outputs.wheel_bytes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 observed in prior public run
+        with:
+          persist-credentials: false
+      - name: Resolve exact public lock
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 12):
+              raise SystemExit("Python 3.12 is required")
+          PY
+          mkdir -p out/public-deps .public-wheelhouse
+          start="$(date +%s%N)"
+          python3 -m pip install --dry-run --ignore-installed --only-binary=:all: \
+            --report out/public-deps/resolve-report.json \
+            -r public_env/requirements-core.txt --quiet
+          python3 public_env/public_deps.py resolve-lock \
+            out/public-deps/resolve-report.json out/public-deps/resolved.lock
+          lock_sha="$(python3 public_env/public_deps.py lock-sha out/public-deps/resolved.lock)"
+          end="$(date +%s%N)"
+          echo "lock_sha=$lock_sha" >> "$GITHUB_OUTPUT"
+          echo "elapsed_ms=$(( (end-start)/1000000 ))" >> "$GITHUB_OUTPUT"
+      - name: Mark cache restore start
+        id: restore_start
+        shell: bash
+        run: echo "start_ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+      - name: Restore or stage public wheelhouse cache
+        id: wheels
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-${{ env.PUBLIC_WHEELHOUSE_BUILD }}-${{ runner.os }}-${{ runner.arch }}-${{ env.PUBLIC_PYTHON_ABI }}-${{ steps.resolve.outputs.lock_sha }}
+      - name: Record cache restore time
+        id: restore_time
+        shell: bash
+        run: |
+          end="$(date +%s%N)"
+          echo "elapsed_ms=$(( (end-${{ steps.restore_start.outputs.start_ns }})/1000000 ))" >> "$GITHUB_OUTPUT"
+      - name: Populate wheelhouse on exact miss
+        id: download
+        shell: bash
+        run: |
+          set -euo pipefail
+          start="$(date +%s%N)"
+          if [ "${{ steps.wheels.outputs.cache-hit }}" != "true" ]; then
+            python3 -m pip download --only-binary=:all: --dest .public-wheelhouse \
+              -r out/public-deps/resolved.lock --quiet
+          fi
+          end="$(date +%s%N)"
+          echo "elapsed_ms=$(( (end-start)/1000000 ))" >> "$GITHUB_OUTPUT"
+      - name: Audit wheelhouse boundary
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 public_env/public_deps.py wheel-manifest .public-wheelhouse \
+            > out/public-deps/wheel-manifest.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          m=json.load(open("out/public-deps/wheel-manifest.json", encoding="utf-8"))
+          print(f"wheel_count={m['wheel_count']}")
+          print(f"wheel_bytes={m['wheel_bytes']}")
+          PY
+      - name: Install and smoke from wheelhouse
+        id: install
+        shell: bash
+        run: |
+          set -euo pipefail
+          start="$(date +%s%N)"
+          python3 -m venv /tmp/public-science-env
+          /tmp/public-science-env/bin/python -m pip install --no-index \
+            --find-links "$PWD/.public-wheelhouse" \
+            -r out/public-deps/resolved.lock --quiet
+          /tmp/public-science-env/bin/python public_env/public_deps.py smoke \
+            > out/public-deps/build-smoke.json
+          end="$(date +%s%N)"
+          echo "elapsed_ms=$(( (end-start)/1000000 ))" >> "$GITHUB_OUTPUT"
+
+  warm-restore:
+    needs: build-wheelhouse
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 observed in prior public run
+        with:
+          persist-credentials: false
+      - name: Re-resolve and verify lock identity
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          if sys.version_info[:2] != (3, 12):
+              raise SystemExit("Python 3.12 is required")
+          PY
+          mkdir -p out/public-deps
+          start="$(date +%s%N)"
+          python3 -m pip install --dry-run --ignore-installed --only-binary=:all: \
+            --report out/public-deps/resolve-report.json \
+            -r public_env/requirements-core.txt --quiet
+          python3 public_env/public_deps.py resolve-lock \
+            out/public-deps/resolve-report.json out/public-deps/resolved.lock
+          lock_sha="$(python3 public_env/public_deps.py lock-sha out/public-deps/resolved.lock)"
+          test "$lock_sha" = "${{ needs.build-wheelhouse.outputs.lock_sha }}"
+          end="$(date +%s%N)"
+          echo "lock_sha=$lock_sha" >> "$GITHUB_OUTPUT"
+          echo "elapsed_ms=$(( (end-start)/1000000 ))" >> "$GITHUB_OUTPUT"
+      - name: Mark warm restore start
+        id: restore_start
+        shell: bash
+        run: echo "start_ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+      - name: Restore exact public wheelhouse
+        id: wheels
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-${{ env.PUBLIC_WHEELHOUSE_BUILD }}-${{ runner.os }}-${{ runner.arch }}-${{ env.PUBLIC_PYTHON_ABI }}-${{ steps.resolve.outputs.lock_sha }}
+          fail-on-cache-miss: true
+      - name: Verify warm cache hit and record time
+        id: restore_time
+        shell: bash
+        run: |
+          set -euo pipefail
+          end="$(date +%s%N)"
+          test "${{ steps.wheels.outputs.cache-hit }}" = "true"
+          echo "elapsed_ms=$(( (end-${{ steps.restore_start.outputs.start_ns }})/1000000 ))" >> "$GITHUB_OUTPUT"
+      - name: Install and smoke restored wheelhouse
+        id: install
+        shell: bash
+        run: |
+          set -euo pipefail
+          start="$(date +%s%N)"
+          python3 -m venv /tmp/public-science-env-warm
+          /tmp/public-science-env-warm/bin/python -m pip install --no-index \
+            --find-links "$PWD/.public-wheelhouse" \
+            -r out/public-deps/resolved.lock --quiet
+          /tmp/public-science-env-warm/bin/python public_env/public_deps.py smoke \
+            > out/public-deps/warm-smoke.json
+          end="$(date +%s%N)"
+          echo "elapsed_ms=$(( (end-start)/1000000 ))" >> "$GITHUB_OUTPUT"
+      - name: Record public cache evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 public_env/public_deps.py wheel-manifest .public-wheelhouse \
+            > out/public-deps/wheel-manifest.json
+          python3 - <<'PY'
+          import json, os
+          root="out/public-deps"
+          manifest=json.load(open(f"{root}/wheel-manifest.json", encoding="utf-8"))
+          status={
+              "schema":"public-wheelhouse-cache-test/1",
+              "scope":"public packages and synthetic import/fingerprint smoke only",
+              "cache_content":"wheelhouse only",
+              "cache_restore_keys":False,
+              "python_abi":"cp312",
+              "lock_sha256":os.environ["LOCK_SHA"],
+              "build":{
+                  "cache_hit":os.environ.get("FIRST_HIT","") == "true",
+                  "resolve_ms":int(os.environ["BUILD_RESOLVE_MS"]),
+                  "restore_ms":int(os.environ["BUILD_RESTORE_MS"]),
+                  "download_ms":int(os.environ["BUILD_DOWNLOAD_MS"]),
+                  "install_and_smoke_ms":int(os.environ["BUILD_INSTALL_MS"]),
+              },
+              "warm":{
+                  "cache_hit":True,
+                  "resolve_ms":int(os.environ["WARM_RESOLVE_MS"]),
+                  "restore_ms":int(os.environ["WARM_RESTORE_MS"]),
+                  "install_and_smoke_ms":int(os.environ["WARM_INSTALL_MS"]),
+              },
+              "wheel_count":manifest["wheel_count"],
+              "wheel_bytes":manifest["wheel_bytes"],
+          }
+          with open(f"{root}/cache-status.json","w",encoding="utf-8") as f:
+              json.dump(status,f,indent=2,sort_keys=True)
+              f.write("\n")
+          PY
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### Public wheelhouse cache test
+          - exact lock SHA256: ${{ steps.resolve.outputs.lock_sha }}
+          - first-job cache hit: ${{ needs.build-wheelhouse.outputs.first_cache_hit }}
+          - warm-job cache hit: ${{ steps.wheels.outputs.cache-hit }}
+          - wheel count: ${{ needs.build-wheelhouse.outputs.wheel_count }}
+          - wheel bytes: ${{ needs.build-wheelhouse.outputs.wheel_bytes }}
+          - build resolve/restore/download/install ms: ${{ needs.build-wheelhouse.outputs.resolve_ms }} / ${{ needs.build-wheelhouse.outputs.restore_ms }} / ${{ needs.build-wheelhouse.outputs.download_ms }} / ${{ needs.build-wheelhouse.outputs.install_ms }}
+          - warm resolve/restore/install ms: ${{ steps.resolve.outputs.elapsed_ms }} / ${{ steps.restore_time.outputs.elapsed_ms }} / ${{ steps.install.outputs.elapsed_ms }}
+          EOF
+        env:
+          LOCK_SHA: ${{ steps.resolve.outputs.lock_sha }}
+          FIRST_HIT: ${{ needs.build-wheelhouse.outputs.first_cache_hit }}
+          BUILD_RESOLVE_MS: ${{ needs.build-wheelhouse.outputs.resolve_ms }}
+          BUILD_RESTORE_MS: ${{ needs.build-wheelhouse.outputs.restore_ms }}
+          BUILD_DOWNLOAD_MS: ${{ needs.build-wheelhouse.outputs.download_ms }}
+          BUILD_INSTALL_MS: ${{ needs.build-wheelhouse.outputs.install_ms }}
+          WARM_RESOLVE_MS: ${{ steps.resolve.outputs.elapsed_ms }}
+          WARM_RESTORE_MS: ${{ steps.restore_time.outputs.elapsed_ms }}
+          WARM_INSTALL_MS: ${{ steps.install.outputs.elapsed_ms }}
+      - name: Upload public cache evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7 observed in prior public run
+        with:
+          name: "public-deps-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: |
+            out/public-deps/resolved.lock
+            out/public-deps/cache-status.json
+            out/public-deps/wheel-manifest.json
+            out/public-deps/warm-smoke.json
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: false
