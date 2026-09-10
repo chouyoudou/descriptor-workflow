@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import sys
 
 
 def cell_volume(lattice):
@@ -33,15 +34,34 @@ def main():
     parser = argparse.ArgumentParser(description="Compute unit-cell geometry.")
     parser.add_argument("input", type=Path, help="JSON file containing cells")
     args = parser.parse_args()
-    cells = json.loads(args.input.read_text(encoding="utf-8"))
-    results = [
-        {"id": cell["id"],
-         "volume_angstrom3": cell_volume(cell["lattice"]),
-         "volume_per_atom_angstrom3": volume_per_atom(cell["lattice"], cell["atom_count"])}
-        for cell in cells
-    ]
+    try:
+        cells = json.loads(args.input.read_text(encoding="utf-8"))
+        if not isinstance(cells, list):
+            raise ValueError("input must be a JSON array of cells")
+        results = [
+            {"id": cell["id"],
+             "volume_angstrom3": cell_volume(cell["lattice"]),
+             "volume_per_atom_angstrom3": volume_per_atom(cell["lattice"], cell["atom_count"])}
+            for cell in cells
+        ]
+    except FileNotFoundError:
+        print("error: input file not found", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError:
+        print("error: invalid JSON input", file=sys.stderr)
+        return 2
+    except OSError:
+        print("error: unable to read input file", file=sys.stderr)
+        return 2
+    except (KeyError, TypeError):
+        print("error: invalid cell input", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(results, indent=2, allow_nan=False))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

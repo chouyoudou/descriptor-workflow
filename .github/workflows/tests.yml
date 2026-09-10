@@ -26,4 +26,14 @@ jobs:
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
       - name: Example calculation
-        run: python3 crystal_geometry.py examples/cells.json
+        run: |
+          mkdir -p out
+          python3 crystal_geometry.py examples/cells.json > out/example-results.json
+          python3 -m json.tool out/example-results.json > /dev/null
+      - name: Upload example result
+        uses: actions/upload-artifact@v7
+        with:
+          name: "example-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: out/example-results.json
+          if-no-files-found: error
+          retention-days: 14
