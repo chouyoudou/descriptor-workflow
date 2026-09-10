@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve, audit, and smoke-test the public scientific dependency environment."""
+"""Audit and smoke-test the pinned public scientific dependency environment."""
 from __future__ import annotations
 
 import argparse
@@ -7,55 +7,101 @@ import hashlib
 from importlib import metadata
 import json
 from pathlib import Path
+import re
 import sys
-from urllib.parse import urlparse
 
-PUBLIC_PACKAGE_HOSTS = {"files.pythonhosted.org", "pypi.org"}
+PIN_RE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s=]+)$")
 
 
-def resolve_lock(report_path: Path, lock_path: Path) -> None:
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    pins = {}
-    for item in report.get("install", []):
-        info = item.get("download_info") or {}
-        url = str(info.get("url") or "")
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname not in PUBLIC_PACKAGE_HOSTS:
-            raise SystemExit("resolver returned a non-PyPI package source")
-        meta = item.get("metadata") or {}
-        name, version = str(meta.get("name") or ""), str(meta.get("version") or "")
-        if not name or not version or "\n" in name or "\n" in version:
-            raise SystemExit("resolver returned invalid package metadata")
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def parse_lock(lock_path: Path) -> list[tuple[str, str]]:
+    pins: list[tuple[str, str]] = []
+    normalized_seen: set[str] = set()
+    raw = lock_path.read_text(encoding="utf-8")
+    if not raw.endswith("\n"):
+        raise SystemExit("lock must end with a newline")
+    for line in raw.splitlines():
+        match = PIN_RE.fullmatch(line)
+        if match is None:
+            raise SystemExit("lock contains a non-exact requirement")
+        name, version = match.groups()
         normalized = name.lower().replace("_", "-")
-        old = pins.setdefault(normalized, (name, version))
-        if old[1] != version:
-            raise SystemExit("resolver returned conflicting package versions")
+        if normalized in normalized_seen:
+            raise SystemExit("lock contains a duplicate distribution")
+        normalized_seen.add(normalized)
+        pins.append((name, version))
     if not pins:
-        raise SystemExit("resolver returned an empty lock")
-    text = "".join(f"{name}=={version}\n" for _, (name, version) in sorted(pins.items()))
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path.write_text(text, encoding="utf-8")
+        raise SystemExit("lock is empty")
+    return pins
 
 
-def lock_sha(lock_path: Path) -> str:
-    return hashlib.sha256(lock_path.read_bytes()).hexdigest()
-
-
-def wheel_manifest(wheelhouse: Path) -> dict[str, object]:
-    files = sorted(p for p in wheelhouse.iterdir() if p.is_file())
-    if not files:
-        raise SystemExit("wheelhouse is empty")
+def verify_lock(lock_path: Path, expected_sha256: str, expected_count: int) -> dict[str, object]:
+    observed = sha256_file(lock_path)
+    pins = parse_lock(lock_path)
+    if observed != expected_sha256:
+        raise SystemExit("pinned lock SHA256 mismatch")
+    if len(pins) != expected_count:
+        raise SystemExit("pinned lock package count mismatch")
     return {
-        "wheel_count": len(files),
-        "wheel_bytes": sum(p.stat().st_size for p in files),
-        "wheel_filenames": [p.name for p in files],
-        "wheel_sha256": {
-            p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files
-        },
+        "schema": "public-pinned-lock-check/1",
+        "sha256": observed,
+        "package_count": len(pins),
     }
 
 
-def smoke() -> None:
+def wheel_manifest(wheelhouse: Path) -> dict[str, object]:
+    entries = sorted(wheelhouse.iterdir(), key=lambda p: p.name)
+    if not entries:
+        raise SystemExit("wheelhouse is empty")
+    for path in entries:
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".whl":
+            raise SystemExit("wheelhouse contains a non-wheel entry")
+    return {
+        "wheel_bytes": sum(path.stat().st_size for path in entries),
+        "wheel_count": len(entries),
+        "wheel_filenames": [path.name for path in entries],
+        "wheel_sha256": {path.name: sha256_file(path) for path in entries},
+    }
+
+
+def verify_wheelhouse(wheelhouse: Path, expected_manifest_path: Path) -> dict[str, object]:
+    expected = json.loads(expected_manifest_path.read_text(encoding="utf-8"))
+    actual = wheel_manifest(wheelhouse)
+    if actual != expected:
+        raise SystemExit("restored wheelhouse does not match pinned manifest")
+    manifest_sha = sha256_file(expected_manifest_path)
+    return {
+        "schema": "public-pinned-wheelhouse-check/1",
+        "manifest_sha256": manifest_sha,
+        "wheel_count": actual["wheel_count"],
+        "wheel_bytes": actual["wheel_bytes"],
+        "exact_file_set_and_sha256": True,
+    }
+
+
+def verify_installed(lock_path: Path) -> dict[str, object]:
+    pins = parse_lock(lock_path)
+    for name, expected in pins:
+        try:
+            observed = metadata.version(name)
+        except metadata.PackageNotFoundError as exc:
+            raise SystemExit("locked distribution is not installed") from exc
+        if observed != expected:
+            raise SystemExit("installed distribution version does not match lock")
+    return {
+        "schema": "public-installed-lock-check/1",
+        "verified_packages": len(pins),
+    }
+
+
+def smoke() -> dict[str, object]:
     import numpy as np
     import scipy
     import spglib
@@ -70,8 +116,8 @@ def smoke() -> None:
     values = np.asarray(fp.featurize(structure, 0), dtype=float)
     if values.shape != (61,) or not np.isfinite(values).all():
         raise SystemExit("public synthetic fingerprint smoke failed")
-    payload = {
-        "schema": "public-scientific-env-smoke/1",
+    return {
+        "schema": "public-scientific-env-smoke/2",
         "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "packages": {
             name: metadata.version(name)
@@ -81,29 +127,38 @@ def smoke() -> None:
         "finite_coordinates": int(np.isfinite(values).sum()),
         "synthetic_only": True,
     }
+
+
+def emit(payload: dict[str, object]) -> None:
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("resolve-lock")
-    p.add_argument("report", type=Path)
+    p = sub.add_parser("verify-lock")
     p.add_argument("lock", type=Path)
-    p = sub.add_parser("lock-sha")
+    p.add_argument("expected_sha256")
+    p.add_argument("expected_count", type=int)
+    p = sub.add_parser("verify-wheelhouse")
+    p.add_argument("wheelhouse", type=Path)
+    p.add_argument("expected_manifest", type=Path)
+    p = sub.add_parser("verify-installed")
     p.add_argument("lock", type=Path)
     p = sub.add_parser("wheel-manifest")
     p.add_argument("wheelhouse", type=Path)
     sub.add_parser("smoke")
     args = parser.parse_args()
-    if args.cmd == "resolve-lock":
-        resolve_lock(args.report, args.lock)
-    elif args.cmd == "lock-sha":
-        print(lock_sha(args.lock))
+    if args.cmd == "verify-lock":
+        emit(verify_lock(args.lock, args.expected_sha256, args.expected_count))
+    elif args.cmd == "verify-wheelhouse":
+        emit(verify_wheelhouse(args.wheelhouse, args.expected_manifest))
+    elif args.cmd == "verify-installed":
+        emit(verify_installed(args.lock))
     elif args.cmd == "wheel-manifest":
-        print(json.dumps(wheel_manifest(args.wheelhouse), sort_keys=True, separators=(",", ":")))
+        emit(wheel_manifest(args.wheelhouse))
     else:
-        smoke()
+        emit(smoke())
     return 0
 
 
