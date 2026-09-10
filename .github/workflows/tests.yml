@@ -100,53 +100,79 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f out/plain.json
-          openssl version | grep -q '^OpenSSL 3\.'
-          openssl list -cipher-algorithms | grep -q 'AES-256-GCM'
           keydir="$(mktemp -d)"
+          success=0
           cleanup() {
             rm -rf "$keydir"
             rm -f out/plain.json out/internal-status.json
+            if [ "$success" -ne 1 ]; then
+              rm -f out/publish/result.cms.der out/publish/status.json
+            fi
           }
           trap cleanup EXIT
+          run_stage() {
+            local name="$1"
+            shift
+            set +e
+            "$@" >"$keydir/${name}.stdout" 2>"$keydir/${name}.stderr"
+            local rc=$?
+            set -e
+            printf 'CMS_STAGE=%s EXIT=%d\n' "$name" "$rc"
+            [ "$rc" -eq 0 ] || exit "$rc"
+          }
 
-          openssl req -x509 -newkey rsa:2048 -nodes \
-            -subj /CN=restricted-output-ephemeral \
-            -keyout "$keydir/key.pem" -out "$keydir/cert.pem" -days 1 >/dev/null 2>&1
+          if [ -f out/plain.json ]; then
+            printf 'CMS_STAGE=input-present EXIT=0\n'
+          else
+            printf 'CMS_STAGE=input-present EXIT=1\n'
+            exit 1
+          fi
           mkdir -p out/publish
-          openssl cms -encrypt -binary -in out/plain.json \
+
+          run_stage cert openssl req -x509 -newkey rsa:2048 -nodes \
+            -subj /CN=restricted-output-ephemeral \
+            -keyout "$keydir/key.pem" -out "$keydir/cert.pem" -days 1
+          run_stage encrypt openssl cms -encrypt -binary -in out/plain.json \
             -out out/publish/result.cms.der -outform DER \
-            -aes-256-gcm "$keydir/cert.pem" >/dev/null 2>&1
-          openssl cms -cmsout -print -inform DER -in out/publish/result.cms.der 2>/dev/null | grep -qi 'aes-256-gcm'
-
-          openssl cms -decrypt -binary -in out/publish/result.cms.der -inform DER \
+            -aes-256-gcm "$keydir/cert.pem"
+          run_stage inspect openssl cms -cmsout -print -inform DER \
+            -in out/publish/result.cms.der
+          run_stage cipher-confirm python3 -c \
+            'from pathlib import Path; import re,sys; text=Path(sys.argv[1]).read_text(errors="replace").lower(); pats=(r"aes-256-gcm",r"id-aes256-gcm",r"2\.16\.840\.1\.101\.3\.4\.1\.46"); sys.exit(0 if any(re.search(p,text) for p in pats) else 1)' \
+            "$keydir/inspect.stdout"
+          run_stage decrypt openssl cms -decrypt -binary \
+            -in out/publish/result.cms.der -inform DER \
             -recip "$keydir/cert.pem" -inkey "$keydir/key.pem" \
-            -out "$keydir/roundtrip.tmp" >/dev/null 2>&1
-          cmp out/plain.json "$keydir/roundtrip.tmp"
+            -out "$keydir/roundtrip.tmp"
+          run_stage roundtrip-compare cmp -s out/plain.json "$keydir/roundtrip.tmp"
+          run_stage tamper-create python3 -c \
+            'from pathlib import Path; import sys; data=bytearray(Path(sys.argv[1]).read_bytes()); len(data) or sys.exit(2); data[-1] ^= 1; Path(sys.argv[2]).write_bytes(data)' \
+            out/publish/result.cms.der "$keydir/tampered.der"
 
-          python3 - out/publish/result.cms.der "$keydir/tampered.der" <<'PY'
-          from pathlib import Path
-          import sys
-          data=bytearray(Path(sys.argv[1]).read_bytes())
-          if not data:
-              raise SystemExit(2)
-          data[-1] ^= 1
-          Path(sys.argv[2]).write_bytes(data)
-          PY
           set +e
           openssl cms -decrypt -binary -in "$keydir/tampered.der" -inform DER \
             -recip "$keydir/cert.pem" -inkey "$keydir/key.pem" \
-            -out "$keydir/rejected.tmp" >/dev/null 2>&1
+            -out "$keydir/rejected.tmp" \
+            >"$keydir/tamper.stdout" 2>"$keydir/tamper.stderr"
           tamper_rc=$?
           set -e
-          test "$tamper_rc" -ne 0
+          printf 'CMS_STAGE=tamper-decrypt EXIT=%d\n' "$tamper_rc"
+          if [ "$tamper_rc" -eq 0 ]; then
+            exit 21
+          fi
           rm -f "$keydir/rejected.tmp"
-          test ! -e "$keydir/rejected.tmp"
+          if [ -e "$keydir/rejected.tmp" ]; then
+            printf 'CMS_STAGE=tamper-reject EXIT=1\n'
+            exit 22
+          fi
+          printf 'CMS_STAGE=tamper-reject EXIT=0\n'
 
           cat > out/publish/status.json <<'JSON'
           {"schema":"restricted-output-test/1","scope":"public synthetic geometry only","network_mode":"none","read_only_root":true,"no_new_privileges":true,"cap_drop_all":true,"pids_limit":32,"memory_bytes":134217728,"cpu_limit":0.5,"timeout_seconds":10,"max_output_bytes_per_stream":65536,"cms_cipher":"AES-256-GCM","roundtrip_verified":true,"tamper_rejected":true}
           JSON
-          python3 -m json.tool out/publish/status.json >/dev/null
+          run_stage status-validate python3 -m json.tool out/publish/status.json
+          success=1
+          printf 'CMS_STAGE=publish-ready EXIT=0\n'
       - name: Upload encrypted synthetic result
         uses: actions/upload-artifact@v7
         with:
