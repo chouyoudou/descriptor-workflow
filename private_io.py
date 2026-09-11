@@ -288,10 +288,11 @@ def execute(task_dir, output_dir, image, timeout):
     cmd = ["docker", "create", "--name", name, "--network", "none", "--read-only",
            "--user", f"{os.getuid()}:{os.getgid()}",
            "--security-opt", "no-new-privileges:true", "--cap-drop", "ALL",
-           "--pids-limit", "128", "--memory", "4g", "--cpus", "2",
+           "--pids-limit", "128", "--memory", "4g", "--cpus", "4",
            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777",
            "-e", "MPLCONFIGDIR=/tmp/matplotlib", "-e", "XDG_CACHE_HOME=/tmp/cache",
            "-e", "OPENBLAS_NUM_THREADS=1", "-e", "OMP_NUM_THREADS=1",
+           "-e", "DESCRIPTOR_WORKERS=4",
            "--mount", f"type=bind,src={Path(task_dir).resolve()},dst=/task,readonly",
            "--mount", f"type=bind,src={out.resolve()},dst=/output",
            "--workdir", "/task", image, "python3", "-B", "/task/run_task.py", "--output", "/output"]

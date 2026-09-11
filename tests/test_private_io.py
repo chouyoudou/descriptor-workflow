@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 import urllib.error
+from types import SimpleNamespace
 from unittest import mock
 
 import private_io as pio
@@ -223,6 +224,28 @@ class RecoveryRefTests(unittest.TestCase):
         )
         self.assertLess(create_ref_index, main_move_index)
         self.assertLess(main_move_index, clear_ref_index)
+
+
+class CandidateCpuBudgetTests(unittest.TestCase):
+    def test_four_cpu_budget_and_worker_hint_without_nested_blas_threads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task = root / "task"
+            task.mkdir()
+            result = SimpleNamespace(stdout=b"", stderr=b"", child_exit_code=0,
+                                     timed_out=False, output_limit_exceeded=False)
+            with mock.patch.dict(pio.os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}), \
+                 mock.patch.object(pio.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr=b"")) as docker, \
+                 mock.patch("restricted_exec.run_bounded", return_value=result):
+                pio.execute(task, root / "out", "public-runtime:test", 30)
+            command = docker.call_args_list[0].args[0]
+            self.assertEqual(command[command.index("--cpus") + 1], "4")
+            self.assertEqual(command[command.index("--memory") + 1], "4g")
+            self.assertEqual(command[command.index("--network") + 1], "none")
+            self.assertIn("DESCRIPTOR_WORKERS=4", command)
+            self.assertIn("OPENBLAS_NUM_THREADS=1", command)
+            self.assertIn("OMP_NUM_THREADS=1", command)
+            self.assertFalse(any("PRIVATE_REPO_TOKEN" in argument for argument in command))
 
 
 if __name__ == "__main__":
