@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import stat
 import subprocess
@@ -70,14 +71,69 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     path.chmod(0o600)
 
-def put_files(repo, files):
-    # Read/check/build against one immutable parent; never force or overwrite.
-    for attempt in range(5):
+def append_github_output(key, value):
+    target = os.environ.get("GITHUB_OUTPUT")
+    if target:
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(f"{key}={value}\n")
+
+def _recovery_branch_name(state):
+    digest = hashlib.sha256(state["destination"].encode("utf-8")).hexdigest()[:12]
+    run, attempt = str(state["run_id"]), str(state["run_attempt"])
+    if not run.isdigit() or not attempt.isdigit():
+        raise PrivateIOError("invalid_run_identity")
+    return f"recovery-actions-{run}-{attempt}-{digest}"
+
+def _validate_recovery_branch(branch):
+    if not re.fullmatch(r"recovery-actions-[0-9]+-[0-9]+-[0-9a-f]{12}", branch or ""):
+        raise PrivateIOError("invalid_recovery_branch")
+    return branch
+
+def _set_recovery_ref(repo, branch, commit_sha):
+    branch = _validate_recovery_branch(branch)
+    get_path = f"/repos/{repo}/git/ref/heads/{branch}"
+    patch_path = f"/repos/{repo}/git/refs/heads/{branch}"
+    try:
+        existing = api(get_path)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        api(f"/repos/{repo}/git/refs", "POST",
+            {"ref": f"refs/heads/{branch}", "sha": commit_sha})
+    else:
+        if existing["object"]["sha"] != commit_sha:
+            api(patch_path, "PATCH", {"sha": commit_sha, "force": True})
+    print(f"RECOVERY_STAGE=private-ref-ready REF={branch}")
+
+def _clear_recovery_ref(repo, branch):
+    branch = _validate_recovery_branch(branch)
+    path = f"/repos/{repo}/git/refs/heads/{branch}"
+    try:
+        api(path, "DELETE")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return
+        print(f"RECOVERY_STAGE=private-ref-retained REF={branch}", file=sys.stderr)
+    except (urllib.error.URLError, TimeoutError):
+        print(f"RECOVERY_STAGE=private-ref-retained REF={branch}", file=sys.stderr)
+    else:
+        print(f"RECOVERY_STAGE=private-ref-cleared REF={branch}")
+
+def put_files(repo, files, recovery_branch=None):
+    # Read/check/build against one immutable parent; never force or overwrite main.
+    # Blob SHAs are cached across retries to reduce API traffic under concurrent writers.
+    if recovery_branch is not None:
+        recovery_branch = _validate_recovery_branch(recovery_branch)
+    blob_shas = {}
+    for path, raw in files.items():
+        safe_path(path)
+        if not isinstance(raw, (bytes, bytearray)):
+            raise PrivateIOError("invalid_file_bytes")
+    for attempt in range(7):
         try:
             parent = api(f"/repos/{repo}/git/ref/heads/main")["object"]["sha"]
             entries = []
             for path, raw in files.items():
-                safe_path(path)
                 try:
                     old = content(repo, path, parent)
                 except urllib.error.HTTPError as exc:
@@ -87,26 +143,78 @@ def put_files(repo, files):
                     if old["sha"] != blob_sha(raw):
                         raise PrivateIOError("refuse_different_existing_file")
                     continue
+                if path not in blob_shas:
+                    blob_shas[path] = api(
+                        f"/repos/{repo}/git/blobs", "POST",
+                        {"content": base64.b64encode(raw).decode(), "encoding": "base64"}
+                    )["sha"]
                 entries.append({"path": path, "mode": "100644", "type": "blob",
-                                "sha": api(f"/repos/{repo}/git/blobs", "POST",
-                                           {"content": base64.b64encode(raw).decode(), "encoding": "base64"})["sha"]})
+                                "sha": blob_shas[path]})
             if not entries:
-                return
+                if recovery_branch is not None:
+                    _clear_recovery_ref(repo, recovery_branch)
+                return parent
             tree = api(f"/repos/{repo}/git/commits/{parent}")["tree"]["sha"]
-            new_tree = api(f"/repos/{repo}/git/trees", "POST", {"base_tree": tree, "tree": entries})["sha"]
+            new_tree = api(f"/repos/{repo}/git/trees", "POST",
+                           {"base_tree": tree, "tree": entries})["sha"]
             commit = api(f"/repos/{repo}/git/commits", "POST",
                          {"message": "Record scoped computation output",
                           "tree": new_tree, "parents": [parent]})["sha"]
-            api(f"/repos/{repo}/git/refs/heads/main", "PATCH", {"sha": commit, "force": False})
-            return
+            if recovery_branch is not None:
+                _set_recovery_ref(repo, recovery_branch, commit)
+            api(f"/repos/{repo}/git/refs/heads/main", "PATCH",
+                {"sha": commit, "force": False})
+            if recovery_branch is not None:
+                _clear_recovery_ref(repo, recovery_branch)
+            return commit
         except urllib.error.HTTPError as exc:
-            if exc.code not in {409, 422, 429, 500, 502, 503, 504} or attempt == 4:
+            if exc.code not in {409, 422, 429, 500, 502, 503, 504} or attempt == 6:
                 raise
         except (urllib.error.URLError, TimeoutError):
-            if attempt == 4:
+            if attempt == 6:
                 raise
-        time.sleep(min(2 ** attempt, 16))
+        time.sleep(min(2 ** attempt, 16) + random.uniform(0.0, 0.5))
     raise PrivateIOError("publication_failed")
+
+def _reject_json_constant(value):
+    raise ValueError("nonfinite_json_constant")
+
+def inspect_result_jsonl(path, expected_rows=None):
+    path = Path(path)
+    if not path.exists():
+        return {"status": "missing", "records": 0}
+    try:
+        st = path.lstat()
+    except OSError:
+        return {"status": "invalid", "reason": "stat_failed", "records": 0}
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return {"status": "invalid", "reason": "not_regular_file", "records": 0}
+    if st.st_size <= 0:
+        return {"status": "invalid", "reason": "empty", "records": 0}
+    records = 0
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    return {"status": "invalid", "reason": "blank_line",
+                            "records": records, "line": line_number}
+                try:
+                    row = json.loads(line, parse_constant=_reject_json_constant)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    return {"status": "invalid", "reason": "invalid_json",
+                            "records": records, "line": line_number}
+                if not isinstance(row, dict):
+                    return {"status": "invalid", "reason": "non_object_row",
+                            "records": records, "line": line_number}
+                records += 1
+    except (OSError, UnicodeError):
+        return {"status": "invalid", "reason": "read_failed", "records": records}
+    if records == 0:
+        return {"status": "invalid", "reason": "empty", "records": 0}
+    if type(expected_rows) is int and expected_rows >= 0 and records != expected_rows:
+        return {"status": "invalid", "reason": "row_count_mismatch",
+                "records": records, "expected_rows": expected_rows}
+    return {"status": "valid", "records": records}
 
 def prepare(repo, task_path, request_path, state_path):
     repo = safe_repo(repo)
@@ -147,15 +255,13 @@ def prepare(repo, task_path, request_path, state_path):
     else:
         if complete.get("task_blob") != task_file["sha"]:
             raise PrivateIOError("completed_request_identity_changed")
-        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write("skip=true\n")
+        append_github_output("skip", "true")
         print("PRIVATE_IO_STAGE=already-completed")
         return
     marker = {"stage": "authorized", "source_ref": task["source_ref"],
               "public_commit": state["public_commit"], "run_id": run, "run_attempt": attempt}
     put_files(repo, {state["destination"] + "/start.json": json.dumps(marker, sort_keys=True).encode() + b"\n"})
-    with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-        f.write("skip=false\n")
+    append_github_output("skip", "false")
     print("PRIVATE_IO_STAGE=read-write-authorized")
 
 def fetch(state_path, task_dir):
@@ -222,19 +328,42 @@ def publish(state_path, output_dir):
             raw = path.read_bytes()
             files[state["destination"] + "/" + path.name] = raw
             descriptions[path.name] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+
+    summary = None
+    execution = None
+    if "summary.json" in descriptions:
+        summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    if "execution.json" in descriptions:
+        execution = json.loads((out / "execution.json").read_text(encoding="utf-8"))
+    result_validation = inspect_result_jsonl(
+        out / "result.jsonl",
+        None if not isinstance(summary, dict) else summary.get("rows"),
+    )
     receipt = {"schema": "private-computation-receipt/1", "state": state,
-               "files": descriptions, "materialized_file_present": "result.jsonl" in descriptions,
+               "files": descriptions,
+               "materialized_file_present": "result.jsonl" in descriptions,
+               "result_validation": result_validation,
                "note": "Inspect summary and execution status; receipt alone does not establish scientific success."}
     files[state["destination"] + "/receipt.json"] = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
-    if "summary.json" in descriptions and "execution.json" in descriptions:
-        summary = json.loads((out / "summary.json").read_text())
-        execution = json.loads((out / "execution.json").read_text())
-        if summary.get("stage") == "materialized" and execution.get("exit_code") == 0 and not execution.get("timed_out") and not execution.get("output_limit_exceeded"):
-            complete = {"task_blob": state["task_blob"], "source_ref": state["task"]["source_ref"],
-                        "result_path": state["destination"] + "/result.jsonl",
-                        "receipt_path": state["destination"] + "/receipt.json"}
-            files[state["task"]["output_prefix"] + "/completed.json"] = json.dumps(complete, sort_keys=True).encode() + b"\n"
-    put_files(state["repository"], files)
+
+    success_claim = (
+        isinstance(summary, dict) and summary.get("stage") == "materialized"
+        and isinstance(execution, dict) and execution.get("exit_code") == 0
+        and not execution.get("timed_out")
+        and not execution.get("output_limit_exceeded")
+    )
+    if success_claim and result_validation.get("status") == "valid":
+        complete = {"task_blob": state["task_blob"], "source_ref": state["task"]["source_ref"],
+                    "result_path": state["destination"] + "/result.jsonl",
+                    "receipt_path": state["destination"] + "/receipt.json"}
+        files[state["task"]["output_prefix"] + "/completed.json"] = json.dumps(complete, sort_keys=True).encode() + b"\n"
+
+    recovery_branch = _recovery_branch_name(state)
+    append_github_output("recovery_branch", recovery_branch)
+    put_files(state["repository"], files, recovery_branch=recovery_branch)
+    if success_claim and result_validation.get("status") != "valid":
+        print("PRIVATE_IO_STAGE=invalid-materialized-result", file=sys.stderr)
+        raise PrivateIOError("materialized_result_invalid")
     print("PRIVATE_IO_STAGE=results-saved")
 
 def main():

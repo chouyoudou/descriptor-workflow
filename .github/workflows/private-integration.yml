@@ -219,6 +219,7 @@ jobs:
             --image descriptor-direct-runtime:current --timeout 1800
 
       - name: Persist results and detailed logs only to private repository
+        id: publish
         if: always() && steps.prepare.outcome == 'success' && steps.prepare.outputs.skip != 'true'
         env:
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
@@ -227,6 +228,15 @@ jobs:
           base="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           python3 private_io.py publish \
             --state "$base/context.json" --output "$base/output"
+
+      - name: Report deterministic recovery path after publish failure
+        if: always() && steps.publish.outcome == 'failure'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RECOVERY_STAGE=publish-failed-after-compute"
+          echo "RECOVERY_BRANCH=${{ steps.publish.outputs.recovery_branch }}"
+          echo "RECOVERY_ACTION=inspect-private-recovery-ref-first; if absent, recompute-lightweight-task"
 
       - name: Remove this run's temporary files
         if: always()
