@@ -1,0 +1,96 @@
+name: Scoped private integration
+on:
+  push:
+    branches: [main]
+    paths: ["private_job/request.json"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: scoped-private-integration
+  cancel-in-progress: false
+env:
+  PRIVATE_REPOSITORY: chouyoudou/descriptor-workflow-private
+  PUBLIC_LOCK_SHA: 04c70a3a92a2e7ec98c017cf85be55eebe3242d03de4c86b7d0698b650935678
+  PYTHON_IMAGE: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+jobs:
+  integrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Confirm scoped private read and write
+        id: prepare
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          base="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$base"
+          mkdir -m 0700 "$base"
+          python3 private_io.py prepare --repo "$PRIVATE_REPOSITORY" \
+            --task-path transport/active_task.json --request private_job/request.json \
+            --state "$base/context.json"
+      - name: Restore public dependencies only
+        id: cache
+        if: steps.prepare.outputs.skip != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-v1-Linux-X64-cp312-${{ env.PUBLIC_LOCK_SHA }}
+      - name: Build runtime before fetching private source
+        if: steps.prepare.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          python3 public_env/public_deps.py verify-lock public_env/resolved.lock "$PUBLIC_LOCK_SHA" 45
+          mkdir -p .public-wheelhouse
+          if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ]; then
+            python3 -m pip download --only-binary=:all: --no-deps \
+              --dest .public-wheelhouse -r public_env/resolved.lock --quiet
+          fi
+          python3 public_env/public_deps.py verify-wheelhouse .public-wheelhouse public_env/wheel-manifest.lock.json
+          build="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/build"
+          mkdir -m 0700 "$build"
+          cp -a .public-wheelhouse "$build/wheels"
+          cp public_env/resolved.lock "$build/requirements.lock"
+          printf 'FROM %s\nCOPY wheels /wheels\nCOPY requirements.lock /tmp/requirements.lock\nRUN python3 -m pip install --no-index --find-links=/wheels -r /tmp/requirements.lock --quiet && rm -rf /wheels /root/.cache/pip\n' "$PYTHON_IMAGE" > "$build/Dockerfile"
+          docker build -t descriptor-direct-runtime:current "$build" >/dev/null
+          echo "RUNTIME_STAGE=ready"
+      - name: Save rebuilt public dependencies before private fetch
+        if: steps.prepare.outputs.skip != 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-v1-Linux-X64-cp312-${{ env.PUBLIC_LOCK_SHA }}
+      - name: Fetch only selected private task files
+        if: steps.prepare.outputs.skip != 'true'
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          umask 077
+          base="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python3 private_io.py fetch --state "$base/context.json" --task-dir "$base/task"
+      - name: Run private tests and materialization without token
+        if: steps.prepare.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python3 private_io.py execute --task-dir "$base/task" --output "$base/output" \
+            --image descriptor-direct-runtime:current --timeout 1800
+      - name: Persist results and detailed logs only to private repository
+        if: always() && steps.prepare.outcome == 'success' && steps.prepare.outputs.skip != 'true'
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          python3 private_io.py publish --state "$base/context.json" --output "$base/output"
+      - name: Remove this run's temporary files
+        if: always()
+        run: |
+          docker rm -f "private-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >/dev/null 2>&1 || true
+          rm -rf "$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
