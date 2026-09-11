@@ -1,0 +1,84 @@
+name: Encrypted code and input demo
+on:
+  push:
+    branches: [main]
+    paths:
+      - "encrypted_job.py"
+      - "encrypted_demo/**"
+      - ".github/workflows/encrypted-packet-demo.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  demo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      TASK_ID: public-demo-20260911-01
+      PYTHON_IMAGE: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Prepare public cryptographic dependency and test envelopes
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/packet-env"
+          "$RUNNER_TEMP/packet-env/bin/python" -m pip install --only-binary=:all: cryptography==49.0.0 --quiet
+          "$RUNNER_TEMP/packet-env/bin/python" -m unittest discover -s encrypted_demo -p 'test_packet.py' -v
+      - name: Decrypt public synthetic task bundle
+        run: |
+          set -euo pipefail
+          umask 077
+          base="$RUNNER_TEMP/enc-demo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$base"
+          mkdir -m 0700 "$base"
+          "$RUNNER_TEMP/packet-env/bin/python" encrypted_job.py unpack \
+            --key-file encrypted_demo/PUBLIC_DEMO_KEY.hex --task-id "$TASK_ID" \
+            --input encrypted_demo/task.json.enc --output "$base/task"
+          mkdir -m 0700 "$base/output"
+      - name: Execute program obtained from decrypted bundle
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/enc-demo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          container="enc-demo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker pull "$PYTHON_IMAGE" >/dev/null
+          docker create --name "$container" \
+            --network none --read-only --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges:true --cap-drop ALL \
+            --pids-limit 32 --memory 128m --cpus 1 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777 \
+            --mount type=bind,src="$base/task",dst=/task,readonly \
+            --mount type=bind,src="$base/output",dst=/output \
+            "$PYTHON_IMAGE" python3 -B /task/entry.py >/dev/null
+          python3 restricted_exec.py --timeout 30 --max-output 65536 \
+            --stdout-file "$base/captured" --status-file "$base/execute-status.json" -- \
+            /usr/bin/docker start -a "$container"
+          echo "EXECUTION_STAGE=decrypted-program-completed"
+      - name: Encrypt result without publishing plaintext
+        run: |
+          set -euo pipefail
+          umask 077
+          base="$RUNNER_TEMP/enc-demo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 0700 "$base/publish"
+          "$RUNNER_TEMP/packet-env/bin/python" encrypted_job.py seal-result \
+            --key-file encrypted_demo/PUBLIC_DEMO_KEY.hex --task-id "$TASK_ID" \
+            --task encrypted_demo/task.json.enc --input "$base/output" \
+            --output "$base/publish/result.enc.json"
+          printf '%s\n' '{"scope":"public-synthetic-demo","real_private_data_used":false,"test_key_is_public":true,"extra_private_repository_credentials":false,"cipher":"AES-256-GCM"}' > "$base/publish/status.json"
+      - name: Upload encrypted result and public status only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: "encrypted-demo-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: |
+            ${{ runner.temp }}/enc-demo-${{ github.run_id }}-${{ github.run_attempt }}/publish/result.enc.json
+            ${{ runner.temp }}/enc-demo-${{ github.run_id }}-${{ github.run_attempt }}/publish/status.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+      - name: Clean this run only
+        if: always()
+        run: |
+          docker rm -f "enc-demo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >/dev/null 2>&1 || true
+          rm -rf "$RUNNER_TEMP/enc-demo-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
