@@ -1,65 +1,75 @@
 # descriptor-workflow
 
-Public, reusable infrastructure for crystal-geometry utilities and bounded
-scientific execution.
+A small Python toolkit for unit-cell geometry and reproducible scientific jobs.
 
-## Public components
+The repository brings together basic crystal-geometry calculations, a
+resource-limited execution helper, and GitHub Actions workflows with reusable
+Python environments. The tools are intended as building blocks for research
+scripts, rather than a complete materials-modelling package.
 
-- `crystal_geometry.py`: deterministic unit-cell geometry CLI.
-- `restricted_exec.py`: bounded subprocess execution and output capture.
-- `request_contract.py`: non-sensitive task-trigger validation, including
-  descriptor, ML, and infrastructure scheduling lanes.
-- `private_io.py`: scoped fetch/execute/persist transport around an optional
-  private integration task. Scientific definitions and private data are not
-  stored here.
-- `public_env/`: pinned public Python wheels and a content-addressed Docker
-  runtime cache assembled only from public packages.
+## Quick start
 
-## Parallel scheduling contract
+The geometry utility uses only the Python standard library:
 
-A trigger commit changes exactly one public slot file:
-
-```json
-{"version":3,"id":"opaque-task-id","lane":"descriptor","slot":7}
+```bash
+python3 crystal_geometry.py examples/cells.json
 ```
 
-The path must match its lane and slot, for example
-`private_job/slots/descriptor-07.json`. Available slots are:
+It reports the cell volume and volume per atom for each input record. For the
+cubic example, the output includes:
 
-- `descriptor-00` through `descriptor-19`;
-- `ml-00` through `ml-07`;
-- `infrastructure-00` and `infrastructure-01`.
+```json
+{
+  "id": "cubic",
+  "volume_angstrom3": 8,
+  "volume_per_atom_angstrom3": 2.0
+}
+```
 
-Each slot is serial and has a bounded GitHub Actions pending queue; distinct
-slots may execute concurrently. A stable agent should own one descriptor slot.
-The slot file contains no private path, source, data, result, or credential.
+Input is a JSON array of cells. Each cell supplies an identifier, three lattice
+vectors in ångströms (one vector per row), and a positive integer atom count:
 
-## Runtime cache
+```json
+[
+  {
+    "id": "cubic",
+    "lattice": [[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+    "atom_count": 4
+  }
+]
+```
 
-The local-environment CPU runtime is identified by the immutable base-image
-digest plus the exact public lock, wheel manifest, and runtime Dockerfile.
-Actions first restore and verify the complete public runtime image. On a miss it
-falls back to the verified public wheelhouse, builds once, verifies installed
-versions and a synthetic fingerprint smoke, then saves the public-only runtime
-cache before any private source is fetched.
+The calculation uses the supplied cell; it does not standardize the structure
+or determine a primitive cell. See [the examples](examples/cells.json) for
+orthorhombic and skew cells.
 
-The cache is an optimization, not scientific evidence. Private candidate code,
-inputs, outputs, logs, and credentials must never be cached.
+## Components
 
-## Local tests
+| Component | Purpose |
+| --- | --- |
+| [`crystal_geometry.py`](crystal_geometry.py) | Cell volume and volume per atom. |
+| [`restricted_exec.py`](restricted_exec.py) | Subprocess time limits and bounded output capture. |
+| [`public_env/`](public_env/) | Pinned dependencies and reusable Docker runtime caching. |
+| [`request_contract.py`](request_contract.py) | Validation of job requests and execution slots. |
+| [`private_io.py`](private_io.py) | Optional authenticated repository I/O for separately managed job inputs and results. |
+
+The Actions workflows cover public tests, runtime preparation, and configured
+integration jobs. Docker is required for container-based execution; the
+standalone geometry example does not need it.
+
+## Tests
+
+From the repository root:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-## Scope and policy boundary
+The examples and tests exercise the utilities independently of any particular
+research dataset.
 
-This repository must remain a real public software project: public geometry,
-execution isolation, request validation, cache construction, tests, and
-documentation belong here. Private scientific implementations, structure
-datasets, element tables, detailed results, and research reports do not.
+## Project status
 
-Adding unrelated or cosmetic files to make a private workload appear compliant
-is not an accepted strategy and provides no GitHub policy or account-safety
-guarantee. Public Actions runs should genuinely test or operate this public
-software.
+This is an experimental toolkit. Interfaces may change as the execution
+workflow develops. Application-specific models, datasets, and research results
+are maintained separately; they are not part of this distribution.
