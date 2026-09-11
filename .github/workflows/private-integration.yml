@@ -7,6 +7,8 @@ on:
 permissions:
   contents: read
 concurrency:
+  # Keep execution serial until all producers use v2 per-trigger task descriptors.
+  # Multiple agents can already prepare distinct v2 tasks without sharing active_task.json.
   group: scoped-private-integration
   cancel-in-progress: false
 env:
@@ -21,6 +23,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+
+      - name: Resolve non-sensitive trigger contract
+        id: request
+        run: |
+          python3 request_contract.py private_job/request.json \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Confirm scoped private read and write
         id: prepare
         env:
@@ -32,39 +41,56 @@ jobs:
           test ! -e "$base"
           mkdir -m 0700 "$base"
           python3 private_io.py prepare --repo "$PRIVATE_REPOSITORY" \
-            --task-path transport/active_task.json --request private_job/request.json \
+            --task-path "${{ steps.request.outputs.task_path }}" \
+            --request private_job/request.json \
             --state "$base/context.json"
-      - name: Restore public dependencies only
-        id: cache
+
+      - name: Restore content-addressed public dependencies
+        id: cache_v2
         if: steps.prepare.outputs.skip != 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-wheelhouse
+          key: public-wheelhouse-v2-${{ runner.os }}-${{ runner.arch }}-cp312-${{ hashFiles('public_env/resolved.lock', 'public_env/wheel-manifest.lock.json') }}
+
+      - name: Restore exact legacy public cache for one-way migration
+        id: cache_v1
+        if: steps.prepare.outputs.skip != 'true' && steps.cache_v2.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-wheelhouse
           key: public-wheelhouse-v1-Linux-X64-cp312-${{ env.PUBLIC_LOCK_SHA }}
+
       - name: Build runtime before fetching private source
         if: steps.prepare.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          python3 public_env/public_deps.py verify-lock public_env/resolved.lock "$PUBLIC_LOCK_SHA" 45
+          python3 public_env/public_deps.py verify-lock \
+            public_env/resolved.lock "$PUBLIC_LOCK_SHA" 45
           mkdir -p .public-wheelhouse
-          if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ]; then
+          if [ "${{ steps.cache_v2.outputs.cache-hit }}" != "true" ] && \
+             [ "${{ steps.cache_v1.outputs.cache-hit }}" != "true" ]; then
             python3 -m pip download --only-binary=:all: --no-deps \
               --dest .public-wheelhouse -r public_env/resolved.lock --quiet
           fi
-          python3 public_env/public_deps.py verify-wheelhouse .public-wheelhouse public_env/wheel-manifest.lock.json
+          python3 public_env/public_deps.py verify-wheelhouse \
+            .public-wheelhouse public_env/wheel-manifest.lock.json
           build="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/build"
           mkdir -m 0700 "$build"
           cp -a .public-wheelhouse "$build/wheels"
           cp public_env/resolved.lock "$build/requirements.lock"
-          printf 'FROM %s\nCOPY wheels /wheels\nCOPY requirements.lock /tmp/requirements.lock\nRUN python3 -m pip install --no-index --find-links=/wheels -r /tmp/requirements.lock --quiet && rm -rf /wheels /root/.cache/pip\n' "$PYTHON_IMAGE" > "$build/Dockerfile"
+          printf 'FROM %s\nCOPY wheels /wheels\nCOPY requirements.lock /tmp/requirements.lock\nRUN python3 -m pip install --no-index --find-links=/wheels -r /tmp/requirements.lock --quiet && rm -rf /wheels /root/.cache/pip\n' \
+            "$PYTHON_IMAGE" > "$build/Dockerfile"
           docker build -t descriptor-direct-runtime:current "$build" >/dev/null
           echo "RUNTIME_STAGE=ready"
-      - name: Save rebuilt public dependencies before private fetch
-        if: steps.prepare.outputs.skip != 'true' && steps.cache.outputs.cache-hit != 'true'
+
+      - name: Save verified content-addressed public cache
+        if: steps.prepare.outputs.skip != 'true' && steps.cache_v2.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-wheelhouse
-          key: public-wheelhouse-v1-Linux-X64-cp312-${{ env.PUBLIC_LOCK_SHA }}
+          key: public-wheelhouse-v2-${{ runner.os }}-${{ runner.arch }}-cp312-${{ hashFiles('public_env/resolved.lock', 'public_env/wheel-manifest.lock.json') }}
+
       - name: Fetch only selected private task files
         if: steps.prepare.outputs.skip != 'true'
         env:
@@ -73,14 +99,18 @@ jobs:
           set -euo pipefail
           umask 077
           base="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          python3 private_io.py fetch --state "$base/context.json" --task-dir "$base/task"
+          python3 private_io.py fetch \
+            --state "$base/context.json" --task-dir "$base/task"
+
       - name: Run private tests and materialization without token
         if: steps.prepare.outputs.skip != 'true'
         run: |
           set -euo pipefail
           base="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          python3 private_io.py execute --task-dir "$base/task" --output "$base/output" \
+          python3 private_io.py execute \
+            --task-dir "$base/task" --output "$base/output" \
             --image descriptor-direct-runtime:current --timeout 1800
+
       - name: Persist results and detailed logs only to private repository
         if: always() && steps.prepare.outcome == 'success' && steps.prepare.outputs.skip != 'true'
         env:
@@ -88,9 +118,12 @@ jobs:
         run: |
           set -euo pipefail
           base="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          python3 private_io.py publish --state "$base/context.json" --output "$base/output"
+          python3 private_io.py publish \
+            --state "$base/context.json" --output "$base/output"
+
       - name: Remove this run's temporary files
         if: always()
         run: |
-          docker rm -f "private-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >/dev/null 2>&1 || true
+          docker rm -f "private-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            >/dev/null 2>&1 || true
           rm -rf "$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
