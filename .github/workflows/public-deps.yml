@@ -143,6 +143,11 @@ jobs:
             --base-image "$PYTHON_IMAGE" \
             --github-output "$GITHUB_OUTPUT" \
             --json-output out/runtime/profile.json
+
+      - name: Confirm profile identity from prior job
+        shell: bash
+        run: |
+          set -euo pipefail
           test "${{ needs.build-runtime.outputs.profile_digest }}" = \
                "${{ steps.profile.outputs.profile_digest }}"
 
