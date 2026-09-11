@@ -143,7 +143,7 @@ def _commit_changes(commit: Mapping[str, Any]) -> tuple[set[str], set[str], set[
 def discover_request(
     event: Mapping[str, Any], *, event_name: str, repository_root: Path
 ) -> tuple[Path, dict[str, Any]]:
-    """Discover one trigger file from a workflow event without searching."""
+    """Compatibility event discovery; production push runs use exact git diff."""
     if event_name == "workflow_dispatch":
         path = LEGACY_REQUEST_PATH
         return repository_root / path, load_request(
@@ -174,22 +174,13 @@ def discover_request(
         raise RequestContractError("trigger_commit_must_be_isolated")
     if path in removed:
         raise RequestContractError("trigger_file_removed")
-    if path != LEGACY_REQUEST_PATH and path not in (added | modified):
-        raise RequestContractError("slot_trigger_not_written")
-
     file_path = repository_root / path
     return file_path, load_request(file_path, repository_path=path)
 
 
 def _write_outputs(path: Path, contract: Mapping[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
-        for key in (
-            "trigger_id",
-            "task_path",
-            "request_path",
-            "lane",
-            "slot",
-        ):
+        for key in ("trigger_id", "task_path", "request_path", "lane", "slot"):
             handle.write(f"{key}={contract[key]}\n")
         handle.write(
             "parallel_preparation_safe="
@@ -208,6 +199,7 @@ def main() -> int:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--request", type=Path)
     source.add_argument("--event", type=Path)
+    parser.add_argument("--repository-path")
     parser.add_argument("--event-name")
     parser.add_argument("--repository-root", type=Path, default=Path("."))
     parser.add_argument("--github-output", type=Path)
@@ -215,8 +207,12 @@ def main() -> int:
 
     try:
         if args.request is not None:
-            contract = load_request(args.request)
+            contract = load_request(
+                args.request, repository_path=args.repository_path
+            )
         else:
+            if args.repository_path is not None:
+                raise RequestContractError("repository_path_requires_request")
             if not args.event_name:
                 raise RequestContractError("missing_event_name")
             event = json.loads(args.event.read_text(encoding="utf-8"))

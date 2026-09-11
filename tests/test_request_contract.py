@@ -162,6 +162,30 @@ class RequestContractTests(unittest.TestCase):
                 ],
             )
 
+    def test_cli_validates_actual_slot_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            request = Path(tmp) / "slot.json"
+            request.write_text(
+                '{"version":3,"id":"probe","lane":"infrastructure","slot":1}\n',
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(rc.__file__).resolve()),
+                    "--request",
+                    str(request),
+                    "--repository-path",
+                    "private_job/slots/infrastructure-00.json",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 2)
+            self.assertIn("slot_request_path_mismatch", completed.stdout)
+            self.assertEqual(completed.stderr, "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,15 +28,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - name: Resolve isolated non-sensitive trigger
         id: request
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            mapfile -t changed < <(
+              git diff-tree --no-commit-id --name-only -r \
+                "$GITHUB_SHA^" "$GITHUB_SHA"
+            )
+            if [ "${#changed[@]}" -ne 1 ]; then
+              echo "REQUEST_STAGE=failed REASON=trigger_commit_must_change_one_file"
+              exit 2
+            fi
+            request_path="${changed[0]}"
+          else
+            request_path="private_job/request.json"
+          fi
           python3 request_contract.py \
-            --event "$GITHUB_EVENT_PATH" \
-            --event-name "$GITHUB_EVENT_NAME" \
-            --repository-root "$GITHUB_WORKSPACE" \
+            --request "$request_path" \
+            --repository-path "$request_path" \
             --github-output "$GITHUB_OUTPUT"
 
   integrate:
