@@ -1,4 +1,4 @@
-name: Public scientific dependency cache
+name: Public scientific runtime cache
 on:
   push:
     branches: [main]
@@ -8,123 +8,215 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+
 env:
-  PUBLIC_WHEELHOUSE_BUILD: v1
-  PUBLIC_PYTHON_ABI: cp312
   PUBLIC_LOCK_SHA256: 04c70a3a92a2e7ec98c017cf85be55eebe3242d03de4c86b7d0698b650935678
-  PUBLIC_LOCK_COUNT: "45"
+  PYTHON_IMAGE: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+
 jobs:
-  pinned-warm-smoke:
+  build-runtime:
     runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    timeout-minutes: 15
+    outputs:
+      profile_digest: ${{ steps.profile.outputs.profile_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Verify pinned public lock
-        shell: bash
+
+      - name: Derive public runtime identity
+        id: profile
         run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import sys
-          if sys.version_info[:2] != (3, 12):
-              raise SystemExit("Python 3.12 is required")
-          PY
-          mkdir -p out/public-deps
-          python3 public_env/public_deps.py verify-lock \
-            public_env/resolved.lock "$PUBLIC_LOCK_SHA256" "$PUBLIC_LOCK_COUNT" \
-            > out/public-deps/lock-check.json
-      - name: Mark cache restore start
-        id: restore_start
-        shell: bash
-        run: echo "start_ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
-      - name: Restore exact public wheelhouse read-only
-        id: wheels
+          python3 public_env/runtime_cache.py identity \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" \
+            --github-output "$GITHUB_OUTPUT" \
+            --json-output "$RUNNER_TEMP/runtime-profile.json"
+
+      - name: Restore exact public runtime cache
+        id: runtime
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-runtime-cache
+          key: public-runtime-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.profile_digest }}
+
+      - name: Restore public wheelhouse when runtime is absent
+        id: wheels_v2
+        if: steps.runtime.outputs.cache-hit != 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-wheelhouse
-          key: public-wheelhouse-${{ env.PUBLIC_WHEELHOUSE_BUILD }}-${{ runner.os }}-${{ runner.arch }}-${{ env.PUBLIC_PYTHON_ABI }}-${{ env.PUBLIC_LOCK_SHA256 }}
-          fail-on-cache-miss: true
-      - name: Verify cache hit and pinned wheel bytes
-        id: verify_cache
-        shell: bash
-        run: |
-          set -euo pipefail
-          end="$(date +%s%N)"
-          test "${{ steps.wheels.outputs.cache-hit }}" = "true"
-          echo "restore_ms=$(( (end-${{ steps.restore_start.outputs.start_ns }})/1000000 ))" >> "$GITHUB_OUTPUT"
-          start_verify="$(date +%s%N)"
-          python3 public_env/public_deps.py verify-wheelhouse \
-            .public-wheelhouse public_env/wheel-manifest.lock.json \
-            > out/public-deps/wheelhouse-check.json
-          end_verify="$(date +%s%N)"
-          echo "verify_ms=$(( (end_verify-start_verify)/1000000 ))" >> "$GITHUB_OUTPUT"
-      - name: Install offline and smoke pinned environment
-        id: install
+          key: public-wheelhouse-v2-${{ runner.os }}-${{ runner.arch }}-cp312-${{ hashFiles('public_env/resolved.lock', 'public_env/wheel-manifest.lock.json') }}
+
+      - name: Restore exact legacy wheelhouse when needed
+        id: wheels_v1
+        if: steps.runtime.outputs.cache-hit != 'true' && steps.wheels_v2.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-v1-Linux-X64-cp312-${{ env.PUBLIC_LOCK_SHA256 }}
+
+      - name: Load or build verified runtime
+        id: build
         shell: bash
         run: |
           set -euo pipefail
           start="$(date +%s%N)"
-          python3 -m venv /tmp/public-science-env-pinned
-          /tmp/public-science-env-pinned/bin/python -m pip install --no-index \
-            --find-links "$PWD/.public-wheelhouse" \
-            -r public_env/resolved.lock --quiet
-          /tmp/public-science-env-pinned/bin/python public_env/public_deps.py verify-installed \
-            public_env/resolved.lock > out/public-deps/installed-check.json
-          /tmp/public-science-env-pinned/bin/python public_env/public_deps.py smoke \
-            > out/public-deps/warm-smoke.json
+          if [ "${{ steps.runtime.outputs.cache-hit }}" = "true" ]; then
+            docker load -i .public-runtime-cache/runtime.tar >/dev/null
+            mode="cache-hit"
+          else
+            python3 public_env/public_deps.py verify-lock \
+              public_env/resolved.lock "$PUBLIC_LOCK_SHA256" 45 >/dev/null
+            mkdir -p .public-wheelhouse
+            if [ "${{ steps.wheels_v2.outputs.cache-hit }}" != "true" ] && \
+               [ "${{ steps.wheels_v1.outputs.cache-hit }}" != "true" ]; then
+              python3 -m pip download --only-binary=:all: --no-deps \
+                --dest .public-wheelhouse -r public_env/resolved.lock --quiet
+            fi
+            python3 public_env/public_deps.py verify-wheelhouse \
+              .public-wheelhouse public_env/wheel-manifest.lock.json >/dev/null
+            build="$RUNNER_TEMP/runtime-build"
+            rm -rf "$build"
+            install -d -m 0700 "$build"
+            cp -a .public-wheelhouse "$build/wheelhouse"
+            cp public_env/resolved.lock "$build/resolved.lock"
+            cp public_env/runtime.Dockerfile "$build/runtime.Dockerfile"
+            docker build \
+              -f "$build/runtime.Dockerfile" \
+              --build-arg BASE_IMAGE="$PYTHON_IMAGE" \
+              --build-arg PROFILE_DIGEST="${{ steps.profile.outputs.profile_digest }}" \
+              --build-arg LOCK_SHA256="${{ steps.profile.outputs.lock_sha256 }}" \
+              -t descriptor-direct-runtime:current "$build" >/dev/null
+            rm -rf .public-runtime-cache
+            install -d -m 0700 .public-runtime-cache
+            docker save descriptor-direct-runtime:current \
+              -o .public-runtime-cache/runtime.tar
+            mode="built"
+          fi
+          python3 public_env/runtime_cache.py verify-image \
+            --image descriptor-direct-runtime:current \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" \
+            --public-deps public_env/public_deps.py \
+            --json-output "$RUNNER_TEMP/runtime-verification.json" >/dev/null
           end="$(date +%s%N)"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "elapsed_ms=$(( (end-start)/1000000 ))" >> "$GITHUB_OUTPUT"
-      - name: Record pinned public cache evidence
+          echo "archive_bytes=$(stat -c %s .public-runtime-cache/runtime.tar)" >> "$GITHUB_OUTPUT"
+
+      - name: Save exact public runtime cache
+        if: steps.runtime.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-runtime-cache
+          key: public-runtime-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.profile_digest }}
+
+      - name: Save migrated wheelhouse cache
+        if: steps.runtime.outputs.cache-hit != 'true' && steps.wheels_v2.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-v2-${{ runner.os }}-${{ runner.arch }}-cp312-${{ hashFiles('public_env/resolved.lock', 'public_env/wheel-manifest.lock.json') }}
+
+  verify-warm-runtime:
+    needs: build-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Recompute public runtime identity
+        id: profile
+        run: |
+          python3 public_env/runtime_cache.py identity \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" \
+            --github-output "$GITHUB_OUTPUT" \
+            --json-output out/runtime/profile.json
+          test "${{ needs.build-runtime.outputs.profile_digest }}" = \
+               "${{ steps.profile.outputs.profile_digest }}"
+
+      - name: Mark warm restore start
+        id: start
+        run: echo "ns=$(date +%s%N)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore runtime produced by the first job
+        id: runtime
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-runtime-cache
+          key: public-runtime-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.profile_digest }}
+          fail-on-cache-miss: true
+
+      - name: Load, verify, and record warm-cache evidence
+        id: verify
         shell: bash
-        env:
-          RESTORE_MS: ${{ steps.verify_cache.outputs.restore_ms }}
-          VERIFY_MS: ${{ steps.verify_cache.outputs.verify_ms }}
-          INSTALL_MS: ${{ steps.install.outputs.elapsed_ms }}
         run: |
           set -euo pipefail
+          restore_end="$(date +%s%N)"
+          test "${{ steps.runtime.outputs.cache-hit }}" = "true"
+          docker load -i .public-runtime-cache/runtime.tar >/dev/null
+          load_end="$(date +%s%N)"
+          python3 public_env/runtime_cache.py verify-image \
+            --image descriptor-direct-runtime:current \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" \
+            --public-deps public_env/public_deps.py \
+            --json-output out/runtime/verification.json >/dev/null
+          verify_end="$(date +%s%N)"
+          RESTORE_MS="$(( (restore_end-${{ steps.start.outputs.ns }})/1000000 ))" \
+          LOAD_MS="$(( (load_end-restore_end)/1000000 ))" \
+          VERIFY_MS="$(( (verify_end-load_end)/1000000 ))" \
+          ARCHIVE_BYTES="$(stat -c %s .public-runtime-cache/runtime.tar)" \
+          PROFILE_DIGEST="${{ steps.profile.outputs.profile_digest }}" \
           python3 - <<'PY'
           import json, os
           status = {
-              "schema": "public-pinned-wheelhouse-cache-test/1",
-              "scope": "public packages and synthetic fingerprint smoke only",
-              "cache_mode": "restore-only",
+              "schema": "public-runtime-cache-warm-test/1",
+              "scope": "public packages and synthetic import/fingerprint smoke only",
               "cache_hit": True,
-              "cache_restore_keys": False,
-              "lock_sha256": os.environ["PUBLIC_LOCK_SHA256"],
-              "package_count": int(os.environ["PUBLIC_LOCK_COUNT"]),
-              "wheel_manifest_sha256": "3f7d030f7a9d9504dc5c1d57ef6b253dffad4e25423ca55de4ac6ea624b3da69",
-              "wheel_count": 45,
-              "wheel_bytes": 137779615,
+              "profile": "local-environment-cpu-v1",
+              "profile_digest": os.environ["PROFILE_DIGEST"],
+              "runtime_archive_bytes": int(os.environ["ARCHIVE_BYTES"]),
               "restore_ms": int(os.environ["RESTORE_MS"]),
-              "wheel_verify_ms": int(os.environ["VERIFY_MS"]),
-              "offline_install_and_smoke_ms": int(os.environ["INSTALL_MS"]),
+              "docker_load_ms": int(os.environ["LOAD_MS"]),
+              "verify_installed_and_smoke_ms": int(os.environ["VERIFY_MS"]),
+              "private_content_in_cache": False,
           }
-          with open("out/public-deps/cache-status.json", "w", encoding="utf-8") as handle:
+          with open("out/runtime/status.json", "w", encoding="utf-8") as handle:
               json.dump(status, handle, indent=2, sort_keys=True)
               handle.write("\n")
           PY
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ### Pinned public wheelhouse warm smoke
-          - cache mode: restore-only
-          - exact cache hit: true
-          - lock SHA256: $PUBLIC_LOCK_SHA256
-          - packages / wheels: 45 / 45
-          - wheel bytes: 137779615
-          - restore / byte-verify / offline-install+smoke ms: $RESTORE_MS / $VERIFY_MS / $INSTALL_MS
+          ### Public runtime cache
+          - exact warm hit: true
+          - profile: local-environment-cpu-v1
+          - profile digest: ${{ steps.profile.outputs.profile_digest }}
+          - restore / docker-load / verify ms: $(( (restore_end-${{ steps.start.outputs.ns }})/1000000 )) / $(( (load_end-restore_end)/1000000 )) / $(( (verify_end-load_end)/1000000 ))
+          - cache content: public base image + pinned public Python wheels only
           EOF
-      - name: Upload pinned public cache evidence
+
+      - name: Upload public runtime-cache evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: "public-deps-pinned-${{ github.run_id }}-${{ github.run_attempt }}"
+          name: "public-runtime-cache-${{ github.run_id }}-${{ github.run_attempt }}"
           path: |
-            public_env/resolved.lock
-            public_env/wheel-manifest.lock.json
-            out/public-deps/lock-check.json
-            out/public-deps/wheelhouse-check.json
-            out/public-deps/installed-check.json
-            out/public-deps/warm-smoke.json
-            out/public-deps/cache-status.json
+            public_env/runtime.Dockerfile
+            out/runtime/profile.json
+            out/runtime/verification.json
+            out/runtime/status.json
           if-no-files-found: error
           retention-days: 14
           overwrite: false

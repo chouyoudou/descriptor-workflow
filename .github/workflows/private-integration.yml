@@ -2,33 +2,55 @@ name: Scoped private integration
 on:
   push:
     branches: [main]
-    paths: ["private_job/request.json"]
+    paths:
+      - "private_job/request.json"
+      - "private_job/slots/*.json"
   workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  # Keep execution serial until all producers use v2 per-trigger task descriptors.
-  # Multiple agents can already prepare distinct v2 tasks without sharing active_task.json.
-  group: scoped-private-integration
-  cancel-in-progress: false
+
 env:
   PRIVATE_REPOSITORY: chouyoudou/descriptor-workflow-private
   PUBLIC_LOCK_SHA: 04c70a3a92a2e7ec98c017cf85be55eebe3242d03de4c86b7d0698b650935678
   PYTHON_IMAGE: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+
 jobs:
-  integrate:
+  resolve:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 3
+    outputs:
+      trigger_id: ${{ steps.request.outputs.trigger_id }}
+      task_path: ${{ steps.request.outputs.task_path }}
+      request_path: ${{ steps.request.outputs.request_path }}
+      lane: ${{ steps.request.outputs.lane }}
+      slot: ${{ steps.request.outputs.slot }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-
-      - name: Resolve non-sensitive trigger contract
+      - name: Resolve isolated non-sensitive trigger
         id: request
+        shell: bash
         run: |
-          python3 request_contract.py private_job/request.json \
+          set -euo pipefail
+          python3 request_contract.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --repository-root "$GITHUB_WORKSPACE" \
             --github-output "$GITHUB_OUTPUT"
+
+  integrate:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    concurrency:
+      group: scoped-private-${{ needs.resolve.outputs.lane }}-${{ needs.resolve.outputs.slot }}
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Confirm scoped private read and write
         id: prepare
@@ -41,35 +63,81 @@ jobs:
           test ! -e "$base"
           mkdir -m 0700 "$base"
           python3 private_io.py prepare --repo "$PRIVATE_REPOSITORY" \
-            --task-path "${{ steps.request.outputs.task_path }}" \
-            --request private_job/request.json \
+            --task-path "${{ needs.resolve.outputs.task_path }}" \
+            --request "${{ needs.resolve.outputs.request_path }}" \
             --state "$base/context.json"
 
-      - name: Restore content-addressed public dependencies
-        id: cache_v2
+      - name: Derive content-addressed public runtime identity
+        id: profile
         if: steps.prepare.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 public_env/runtime_cache.py identity \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Restore verified public runtime image
+        id: runtime_cache
+        if: steps.prepare.outputs.skip != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-runtime-cache
+          key: public-runtime-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.profile_digest }}
+
+      - name: Load and verify cached public runtime
+        id: runtime
+        if: steps.prepare.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.runtime_cache.outputs.cache-hit }}" = "true" ]; then
+            test -f .public-runtime-cache/runtime.tar
+            docker load -i .public-runtime-cache/runtime.tar >/dev/null
+            python3 public_env/runtime_cache.py verify-image \
+              --image descriptor-direct-runtime:current \
+              --lock public_env/resolved.lock \
+              --manifest public_env/wheel-manifest.lock.json \
+              --dockerfile public_env/runtime.Dockerfile \
+              --base-image "$PYTHON_IMAGE" \
+              --public-deps public_env/public_deps.py \
+              --json-output "$RUNNER_TEMP/runtime-cache-verification.json" >/dev/null
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "RUNTIME_STAGE=cache-hit-verified"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "RUNTIME_STAGE=cache-miss"
+          fi
+
+      - name: Restore content-addressed public wheelhouse
+        id: wheels_v2
+        if: steps.prepare.outputs.skip != 'true' && steps.runtime.outputs.ready != 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-wheelhouse
           key: public-wheelhouse-v2-${{ runner.os }}-${{ runner.arch }}-cp312-${{ hashFiles('public_env/resolved.lock', 'public_env/wheel-manifest.lock.json') }}
 
-      - name: Restore exact legacy public cache for one-way migration
-        id: cache_v1
-        if: steps.prepare.outputs.skip != 'true' && steps.cache_v2.outputs.cache-hit != 'true'
+      - name: Restore exact legacy wheelhouse for one-way migration
+        id: wheels_v1
+        if: steps.prepare.outputs.skip != 'true' && steps.runtime.outputs.ready != 'true' && steps.wheels_v2.outputs.cache-hit != 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-wheelhouse
           key: public-wheelhouse-v1-Linux-X64-cp312-${{ env.PUBLIC_LOCK_SHA }}
 
-      - name: Build runtime before fetching private source
-        if: steps.prepare.outputs.skip != 'true'
+      - name: Build and verify public runtime on cache miss
+        if: steps.prepare.outputs.skip != 'true' && steps.runtime.outputs.ready != 'true'
+        shell: bash
         run: |
           set -euo pipefail
           python3 public_env/public_deps.py verify-lock \
             public_env/resolved.lock "$PUBLIC_LOCK_SHA" 45
           mkdir -p .public-wheelhouse
-          if [ "${{ steps.cache_v2.outputs.cache-hit }}" != "true" ] && \
-             [ "${{ steps.cache_v1.outputs.cache-hit }}" != "true" ]; then
+          if [ "${{ steps.wheels_v2.outputs.cache-hit }}" != "true" ] && \
+             [ "${{ steps.wheels_v1.outputs.cache-hit }}" != "true" ]; then
             python3 -m pip download --only-binary=:all: --no-deps \
               --dest .public-wheelhouse -r public_env/resolved.lock --quiet
           fi
@@ -77,15 +145,41 @@ jobs:
             .public-wheelhouse public_env/wheel-manifest.lock.json
           build="$RUNNER_TEMP/direct-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/build"
           mkdir -m 0700 "$build"
-          cp -a .public-wheelhouse "$build/wheels"
-          cp public_env/resolved.lock "$build/requirements.lock"
-          printf 'FROM %s\nCOPY wheels /wheels\nCOPY requirements.lock /tmp/requirements.lock\nRUN python3 -m pip install --no-index --find-links=/wheels -r /tmp/requirements.lock --quiet && rm -rf /wheels /root/.cache/pip\n' \
-            "$PYTHON_IMAGE" > "$build/Dockerfile"
-          docker build -t descriptor-direct-runtime:current "$build" >/dev/null
-          echo "RUNTIME_STAGE=ready"
+          cp -a .public-wheelhouse "$build/wheelhouse"
+          cp public_env/resolved.lock "$build/resolved.lock"
+          cp public_env/runtime.Dockerfile "$build/runtime.Dockerfile"
+          docker build \
+            -f "$build/runtime.Dockerfile" \
+            --build-arg BASE_IMAGE="$PYTHON_IMAGE" \
+            --build-arg PROFILE_DIGEST="${{ steps.profile.outputs.profile_digest }}" \
+            --build-arg LOCK_SHA256="${{ steps.profile.outputs.lock_sha256 }}" \
+            -t descriptor-direct-runtime:current "$build" >/dev/null
+          python3 public_env/runtime_cache.py verify-image \
+            --image descriptor-direct-runtime:current \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" \
+            --public-deps public_env/public_deps.py \
+            --json-output "$RUNNER_TEMP/runtime-build-verification.json" >/dev/null
+          rm -rf .public-runtime-cache
+          install -d -m 0700 .public-runtime-cache
+          docker save descriptor-direct-runtime:current \
+            -o .public-runtime-cache/runtime.tar
+          test -s .public-runtime-cache/runtime.tar
+          echo "RUNTIME_STAGE=built-and-verified"
 
-      - name: Save verified content-addressed public cache
-        if: steps.prepare.outputs.skip != 'true' && steps.cache_v2.outputs.cache-hit != 'true'
+      - name: Save verified public runtime cache before private fetch
+        if: steps.prepare.outputs.skip != 'true' && steps.runtime.outputs.ready != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-runtime-cache
+          key: public-runtime-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.profile_digest }}
+
+      - name: Save verified content-addressed public wheelhouse
+        if: steps.prepare.outputs.skip != 'true' && steps.runtime.outputs.ready != 'true' && steps.wheels_v2.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-wheelhouse

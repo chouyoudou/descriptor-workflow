@@ -1,69 +1,65 @@
 # descriptor-workflow
 
-Public, reusable utilities for crystal-geometry calculation and bounded GitHub
-Actions execution.
+Public, reusable infrastructure for crystal-geometry utilities and bounded
+scientific execution.
 
-## Public software
+## Public components
 
-- `crystal_geometry.py`: validated unit-cell volume and volume-per-atom CLI.
-- `restricted_exec.py`: bounded subprocess execution with timeout and captured
-  output limits.
-- `public_env/`: exact public Python dependency lock, wheel manifest, and
-  content-addressed wheelhouse verification.
-- `request_contract.py`: validates a deliberately non-sensitive trigger envelope
-  and derives the corresponding private task descriptor path.
-- `private_io.py`: scoped transport used by an optional repository-owner
-  integration test. Scientific source, input data, detailed logs, and results
-  are not stored in this public repository or public artifacts.
+- `crystal_geometry.py`: deterministic unit-cell geometry CLI.
+- `restricted_exec.py`: bounded subprocess execution and output capture.
+- `request_contract.py`: non-sensitive task-trigger validation, including
+  descriptor, ML, and infrastructure scheduling lanes.
+- `private_io.py`: scoped fetch/execute/persist transport around an optional
+  private integration task. Scientific definitions and private data are not
+  stored here.
+- `public_env/`: pinned public Python wheels and a content-addressed Docker
+  runtime cache assembled only from public packages.
 
-The Actions workflows test and exercise these actual public utilities. This
-repository is not a facade for unrelated computation, and its existence does
-not create an exemption from GitHub's terms or security boundaries.
+## Parallel scheduling contract
 
-## Trigger contracts
-
-Legacy serial requests use:
+A trigger commit changes exactly one public slot file:
 
 ```json
-{"id": "direct-example-01"}
+{"version":3,"id":"opaque-task-id","lane":"descriptor","slot":7}
 ```
 
-They resolve to the historical private `transport/active_task.json` pointer.
+The path must match its lane and slot, for example
+`private_job/slots/descriptor-07.json`. Available slots are:
 
-New task preparation should use the version-2 envelope:
+- `descriptor-00` through `descriptor-19`;
+- `ml-00` through `ml-07`;
+- `infrastructure-00` and `infrastructure-01`.
 
-```json
-{"version": 2, "id": "agent-a-0001"}
-```
+Each slot is serial and has a bounded GitHub Actions pending queue; distinct
+slots may execute concurrently. A stable agent should own one descriptor slot.
+The slot file contains no private path, source, data, result, or credential.
 
-This derives a create-only private task descriptor at
-`transport/task_requests/agent-a-0001.json`. The public request contains no
-private source path, data, result, or credential. Execution remains serialized
-until the version-2 path has been qualified under concurrent runs.
+## Runtime cache
 
-## Dependency cache
+The local-environment CPU runtime is identified by the immutable base-image
+digest plus the exact public lock, wheel manifest, and runtime Dockerfile.
+Actions first restore and verify the complete public runtime image. On a miss it
+falls back to the verified public wheelhouse, builds once, verifies installed
+versions and a synthetic fingerprint smoke, then saves the public-only runtime
+cache before any private source is fetched.
 
-The integration workflow verifies the exact lock and every wheel hash before
-installation. Its current cache key includes OS, architecture, Python ABI, and
-the content of both the resolved lock and wheel manifest. A one-way exact
-legacy-cache fallback avoids an unnecessary redownload during migration; no
-fuzzy restore key is used.
+The cache is an optimization, not scientific evidence. Private candidate code,
+inputs, outputs, logs, and credentials must never be cached.
 
-Only public dependency wheels may enter this cache. Private task files,
-candidate code, structures, element tables, captured output, and results must
-never be cached.
-
-## Geometry CLI
-
-```bash
-python3 crystal_geometry.py examples/cells.json
-```
-
-Input lattice vectors use angstroms. Output volume is in cubic angstroms and
-volume per atom in cubic angstroms per atom.
-
-## Tests
+## Local tests
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Scope and policy boundary
+
+This repository must remain a real public software project: public geometry,
+execution isolation, request validation, cache construction, tests, and
+documentation belong here. Private scientific implementations, structure
+datasets, element tables, detailed results, and research reports do not.
+
+Adding unrelated or cosmetic files to make a private workload appear compliant
+is not an accepted strategy and provides no GitHub policy or account-safety
+guarantee. Public Actions runs should genuinely test or operate this public
+software.
