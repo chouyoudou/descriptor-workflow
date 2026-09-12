@@ -288,9 +288,18 @@ class BundleRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             files=self.publish_fixture(Path(tmp))
             self.assertIn('transport/bundle-executions/bt-fixture/completed.json',files)
+            queued=json.loads(files['transport/reviews/pending/bt-fixture/123-1.json'])
+            self.assertEqual(queued['review_status'],'pending')
+            self.assertEqual(queued['execution_status'],'materialized')
+            self.assertEqual(queued['next_action'],'independent_review')
+            self.assertEqual(queued['source_ref'],'b'*40)
         with tempfile.TemporaryDirectory() as tmp:
             files=self.publish_fixture(Path(tmp),result=False)
             self.assertNotIn('transport/bundle-executions/bt-fixture/completed.json',files)
+            queued=json.loads(files['transport/reviews/pending/bt-fixture/123-1.json'])
+            self.assertEqual(queued['review_status'],'pending')
+            self.assertEqual(queued['next_action'],'execution_recovery')
+            self.assertIsNone(queued['result_path'])
 
     def test_no_output_directory_still_gets_failure_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:

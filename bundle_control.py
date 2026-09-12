@@ -455,6 +455,22 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
     files[f"{prefix}/receipt.json"] = (
         json.dumps(receipt, indent=2, sort_keys=True) + "\n"
     ).encode()
+    # Execution completion is not reviewer acceptance. Queue the immutable
+    # delivery in the same private transaction, including partial failures.
+    review_submission = {
+        "schema": "private-review-submission/1",
+        "review_status": "pending",
+        "execution_status": receipt["status"],
+        "next_action": "independent_review" if success else "execution_recovery",
+        "bundle_id": bundle_id, "bundle_blob": bundle_blob,
+        "source_ref": source_ref, "run_id": run, "run_attempt": attempt,
+        "receipt_path": f"{prefix}/receipt.json",
+        "result_path": f"{prefix}/result.jsonl" if "result.jsonl" in collected else None,
+        "summary_path": f"{prefix}/summary.json" if "summary.json" in collected else None,
+    }
+    files[f"transport/reviews/pending/{bundle_id}/{run}-{attempt}.json"] = (
+        json.dumps(review_submission, indent=2, sort_keys=True) + "\n"
+    ).encode()
     if success:
         files[f"transport/bundle-executions/{bundle_id}/completed.json"] = (
             json.dumps(receipt, sort_keys=True) + "\n"
