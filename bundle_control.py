@@ -14,6 +14,7 @@ from pathlib import Path
 import random
 import re
 import stat
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -31,13 +32,17 @@ ALLOWED_INPUT_PREFIXES = (
     "elements/",
     "transport/parallel-",
     "transport/reference/",
+    "transport/executions/",
+    "transport/bundle-executions/",
+    "transport/recovered/",
+    "transport/tasks/",
 )
 MAX_SOURCE_FILES = 12
 MAX_INPUT_FILES = 16
 MAX_SOURCE_FILE = 128 * 1024
 MAX_SOURCE_TOTAL = 512 * 1024
-MAX_INPUT_FILE = 2 * 1024 * 1024
-MAX_INPUT_TOTAL = 8 * 1024 * 1024
+MAX_INPUT_FILE = 32 * 1024 * 1024
+MAX_INPUT_TOTAL = 96 * 1024 * 1024
 MAX_OUTPUT_FILE = 32 * 1024 * 1024
 
 class BundleError(RuntimeError):
@@ -59,14 +64,16 @@ def _retry_delay(exc, attempt):
     if h is not None:
         ra = h.get("Retry-After")
         if ra and str(ra).isdigit():
-            return min(max(int(ra), 1), 120)
+            return max(int(ra), 1)
         reset = h.get("X-RateLimit-Reset")
         remaining = h.get("X-RateLimit-Remaining")
         if reset and remaining == "0":
             try:
-                return min(max(int(reset) - int(time.time()) + 1, 1), 120)
+                return max(int(reset) - int(time.time()) + 1, 1)
             except ValueError:
                 pass
+    if getattr(exc, "code", None) in (403, 429):
+        return 60 * 2 ** attempt
     return min(2 ** attempt, 16) + random.uniform(0.0, 0.4)
 
 def api(path, method="GET", body=None):
@@ -84,7 +91,8 @@ def api(path, method="GET", body=None):
         method=method,
         headers=headers,
     )
-    with urllib.request.urlopen(req, timeout=30) as response:
+    from private_io import NoRedirect
+    with urllib.request.build_opener(NoRedirect).open(req, timeout=30) as response:
         raw = response.read(64 * 1024 * 1024 + 1)
         if len(raw) > 64 * 1024 * 1024:
             raise BundleError("response_too_large")
@@ -104,6 +112,21 @@ def decode_contents(item, limit):
     if hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() != item.get("sha"):
         raise BundleError("blob_identity_mismatch")
     return raw
+
+def read_pinned_file(repo, path, ref, blob, limit):
+    """Use immutable Git blobs when Contents omits bodies above 1 MiB."""
+    item = content(repo, path, ref)
+    if item.get("type") != "file" or item.get("sha") != blob:
+        raise BundleError("pinned_file_identity_mismatch")
+    size = item.get("size")
+    if type(size) is int and size > limit:
+        raise BundleError("file_too_large")
+    if item.get("encoding") != "base64":
+        item = api(f"/repos/{safe_repo(repo)}/git/blobs/{blob}")
+        if item.get("sha") != blob:
+            raise BundleError("blob_identity_mismatch")
+        item = {**item, "type": "file"}
+    return decode_contents(item, limit)
 
 def append_output(key, value):
     p = os.environ.get("GITHUB_OUTPUT")
@@ -142,7 +165,8 @@ def validate_bundle(raw, bundle_id):
     total = 0
     sources = {}
     for name, text in files.items():
-        if not FILE_RE.fullmatch(name) or not isinstance(text, str):
+        if (not FILE_RE.fullmatch(name) or name == "BUNDLE_SOURCE.json"
+                or not isinstance(text, str)):
             raise BundleError("invalid_source_entry")
         data = text.encode("utf-8")
         total += len(data)
@@ -173,7 +197,16 @@ def validate_bundle(raw, bundle_id):
         raise BundleError("invalid_timeout")
     return b, sources, normalized_inputs, timeout_seconds
 
-def put_create_only(repo, files, message):
+def recovery_branch(bundle_id, phase):
+    run = os.environ.get("GITHUB_RUN_ID", "0")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "0")
+    if not run.isdigit() or not attempt.isdigit():
+        raise BundleError("invalid_run_identity")
+    suffix = hashlib.sha256((bundle_id + ":" + phase).encode()).hexdigest()[:12]
+    return f"recovery-actions-{run}-{attempt}-{suffix}"
+
+def put_create_only(repo, files, message, recovery_ref=None):
+    from private_io import _set_recovery_ref, _clear_recovery_ref
     repo = safe_repo(repo)
     blob_shas = {}
     for path, raw in files.items():
@@ -181,6 +214,7 @@ def put_create_only(repo, files, message):
         if not isinstance(raw, (bytes, bytearray)):
             raise BundleError("invalid_file_bytes")
     for attempt in range(7):
+        updating_ref = False
         try:
             parent = api(f"/repos/{repo}/git/ref/heads/main")["object"]["sha"]
             entries = []
@@ -205,6 +239,8 @@ def put_create_only(repo, files, message):
                     "sha": blob_shas[path],
                 })
             if not entries:
+                if recovery_ref:
+                    _clear_recovery_ref(repo, recovery_ref)
                 return parent
             tree = api(f"/repos/{repo}/git/commits/{parent}")["tree"]["sha"]
             new_tree = api(
@@ -215,10 +251,15 @@ def put_create_only(repo, files, message):
                 f"/repos/{repo}/git/commits", "POST",
                 {"message": message, "tree": new_tree, "parents": [parent]},
             )["sha"]
+            if recovery_ref:
+                _set_recovery_ref(repo, recovery_ref, commit)
+            updating_ref = True
             api(
                 f"/repos/{repo}/git/refs/heads/main", "PATCH",
                 {"sha": commit, "force": False},
             )
+            if recovery_ref:
+                _clear_recovery_ref(repo, recovery_ref)
             return commit
         except urllib.error.HTTPError as exc:
             retryable = exc.code in {409, 429, 500, 502, 503, 504}
@@ -226,9 +267,15 @@ def put_create_only(repo, files, message):
                 (getattr(exc, "headers", None) or {}).get("Retry-After")
                 or (getattr(exc, "headers", None) or {}).get("X-RateLimit-Remaining") == "0"
             )
+            # A ref race can be 422. Other 422 validation errors are not retries.
+            if exc.code == 422 and updating_ref:
+                retryable = api(f"/repos/{repo}/git/ref/heads/main")["object"]["sha"] != parent
             if (not retryable and not limited_403) or attempt == 6:
                 raise
-            time.sleep(_retry_delay(exc, attempt))
+            delay = _retry_delay(exc, attempt)
+            if delay > 120:
+                raise BundleError("retry_after_requires_later_resume") from exc
+            time.sleep(delay)
         except (urllib.error.URLError, TimeoutError):
             if attempt == 6:
                 raise
@@ -242,6 +289,24 @@ def materialize(repo, bundle_id):
     item = content(repo, bundle_path, "main")
     raw = decode_contents(item, 1024 * 1024)
     bundle, sources, inputs, timeout_seconds = validate_bundle(raw, bundle_id)
+
+    complete_path = f"transport/bundle-executions/{bundle_id}/completed.json"
+    try:
+        complete = json.loads(decode_contents(content(repo, complete_path, "main"), 65536))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+    else:
+        if (complete.get("bundle_blob") != item["sha"]
+                or complete.get("status") != "materialized"
+                or not REF_RE.fullmatch(complete.get("source_ref", ""))):
+            raise BundleError("completed_bundle_identity_changed")
+        append_output("skip", "true")
+        append_output("source_ref", complete["source_ref"])
+        append_output("bundle_blob", item["sha"])
+        append_output("timeout_seconds", str(timeout_seconds))
+        print("MATERIALIZE_STAGE=already-completed")
+        return
 
     prefix = f"transport/tasks/bundle-materialized/{bundle_id}"
     source_manifest = {
@@ -257,7 +322,8 @@ def materialize(repo, bundle_id):
     formal[f"{prefix}/BUNDLE_SOURCE.json"] = (
         json.dumps(source_manifest, indent=2, sort_keys=True) + "\n"
     ).encode()
-    source_ref = put_create_only(repo, formal, "Materialize validated private task bundle")
+    source_ref = put_create_only(repo, formal, "Materialize validated private task bundle",
+                                 recovery_ref=recovery_branch(bundle_id, "source"))
 
     for name, data in sources.items():
         got = decode_contents(content(repo, f"{prefix}/{name}", source_ref), MAX_SOURCE_FILE)
@@ -267,6 +333,7 @@ def materialize(repo, bundle_id):
     append_output("source_ref", source_ref)
     append_output("bundle_blob", item["sha"])
     append_output("timeout_seconds", str(timeout_seconds))
+    append_output("skip", "false")
     print("MATERIALIZE_STAGE=complete")
 
 def fetch_task(repo, bundle_id, source_ref, dest):
@@ -292,10 +359,7 @@ def fetch_task(repo, bundle_id, source_ref, dest):
         p.chmod(0o400)
 
     for local, spec in manifest.get("inputs", {}).items():
-        item = content(repo, spec["path"], spec["ref"])
-        if item.get("sha") != spec["blob"]:
-            raise BundleError("input_blob_mismatch:" + local)
-        raw = decode_contents(item, MAX_INPUT_FILE)
+        raw = read_pinned_file(repo, spec["path"], spec["ref"], spec["blob"], MAX_INPUT_FILE)
         total_inputs += len(raw)
         if total_inputs > MAX_INPUT_TOTAL:
             raise BundleError("input_total_too_large")
@@ -326,13 +390,14 @@ def validate_jsonl(path, expected_rows):
     return count
 
 def publish(repo, bundle_id, source_ref, bundle_blob, output):
+    from private_io import inspect_result_jsonl
     out = Path(output)
     allowed = {
         "result.jsonl", "summary.json", "focused-and-batch.log",
         "execution.stdout.log", "execution.stderr.log", "execution.json",
     }
     collected = {}
-    for p in out.iterdir():
+    for p in out.iterdir() if out.exists() else ():
         st = p.lstat()
         if p.name not in allowed or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
             raise BundleError("unexpected_output_file:" + p.name)
@@ -340,23 +405,35 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
             raise BundleError("output_too_large:" + p.name)
         collected[p.name] = p.read_bytes()
 
-    for required in ("result.jsonl", "summary.json", "focused-and-batch.log", "execution.json"):
-        if required not in collected:
-            raise BundleError("missing_output:" + required)
-    summary = json.loads(collected["summary.json"], parse_constant=_reject_constant)
-    execution = json.loads(collected["execution.json"], parse_constant=_reject_constant)
+    errors = []
+    def parse_metadata(name):
+        if name not in collected:
+            errors.append("missing_" + name)
+            return {}
+        try:
+            value = json.loads(collected[name], parse_constant=_reject_constant)
+            if not isinstance(value, dict):
+                raise ValueError("metadata_not_object")
+            return value
+        except (ValueError, UnicodeError):
+            errors.append("invalid_" + name)
+            return {}
+    summary = parse_metadata("summary.json")
+    execution = parse_metadata("execution.json")
+    if "focused-and-batch.log" not in collected:
+        errors.append("missing_focused_log")
+    expected_rows = summary.get("rows")
+    result_validation = inspect_result_jsonl(out / "result.jsonl", expected_rows)
     success = (
         summary.get("stage") == "materialized"
         and execution.get("exit_code") == 0
         and not execution.get("timed_out")
         and not execution.get("output_limit_exceeded")
+        and type(expected_rows) is int and expected_rows > 0
+        and result_validation.get("status") == "valid"
+        and not errors
     )
-    if not success:
-        raise BundleError("execution_or_summary_not_successful")
-    expected_rows = summary.get("rows")
-    if type(expected_rows) is not int or expected_rows < 1:
-        raise BundleError("invalid_summary_rows")
-    actual_rows = validate_jsonl(out / "result.jsonl", expected_rows)
+    actual_rows = result_validation.get("records", 0)
 
     run = os.environ.get("GITHUB_RUN_ID", "0")
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "0")
@@ -370,17 +447,24 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
         "run_attempt": attempt,
         "files": {n: hashlib.sha256(b).hexdigest() for n, b in sorted(collected.items())},
         "result_rows": actual_rows,
-        "status": "materialized",
+        "status": "materialized" if success else "failed_or_partial",
+        "result_validation": result_validation,
+        "metadata_errors": errors,
     }
     files = {f"{prefix}/{name}": raw for name, raw in collected.items()}
     files[f"{prefix}/receipt.json"] = (
         json.dumps(receipt, indent=2, sort_keys=True) + "\n"
     ).encode()
-    files[f"transport/bundle-executions/{bundle_id}/completed.json"] = (
-        json.dumps(receipt, sort_keys=True) + "\n"
-    ).encode()
-    commit = put_create_only(repo, files, "Record bundle computation result")
+    if success:
+        files[f"transport/bundle-executions/{bundle_id}/completed.json"] = (
+            json.dumps(receipt, sort_keys=True) + "\n"
+        ).encode()
+    commit = put_create_only(repo, files, "Record bundle computation result",
+                             recovery_ref=recovery_branch(bundle_id, "result"))
     append_output("result_commit", commit)
+    if not success:
+        print("PUBLISH_STAGE=failed-prefix-saved")
+        raise BundleError("failed_execution_preserved")
     print("PUBLISH_STAGE=complete")
 
 def main():
@@ -413,4 +497,11 @@ def main():
         publish(a.repo, a.bundle_id, a.source_ref, a.bundle_blob, a.output)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        code = str(exc).split(":", 1)[0] if isinstance(exc, BundleError) else type(exc).__name__
+        if not re.fullmatch(r"[A-Za-z0-9_]+", code):
+            code = "unexpected_error"
+        print("BUNDLE_STAGE=failed CODE=" + code, file=sys.stderr)
+        raise SystemExit(2)

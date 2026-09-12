@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import private_io as pio
+import bundle_control as bc
 
 
 def _state(root: Path) -> Path:
@@ -246,6 +249,110 @@ class CandidateCpuBudgetTests(unittest.TestCase):
             self.assertIn("OPENBLAS_NUM_THREADS=1", command)
             self.assertIn("OMP_NUM_THREADS=1", command)
             self.assertFalse(any("PRIVATE_REPO_TOKEN" in argument for argument in command))
+
+
+class BundleRecoveryTests(unittest.TestCase):
+    def publish_fixture(self, out, *, exit_code=0, result=True, metadata=True):
+        if metadata:
+            _write_success_metadata(out, rows=2)
+            (out / 'execution.json').write_text(json.dumps({
+                'exit_code':exit_code,'timed_out':False,'output_limit_exceeded':False}))
+            (out / 'focused-and-batch.log').write_text('fixture only\n')
+        if result:
+            (out / 'result.jsonl').write_text('{"id":"a"}\n{"id":"b"}\n')
+        captured={}
+        def put(repo,files,message,recovery_ref=None):
+            captured.update(files);captured['__recovery_ref__']=recovery_ref
+            return 'c'*40
+        with mock.patch.object(bc,'put_create_only',side_effect=put), \
+             mock.patch.dict(bc.os.environ,{'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}):
+            if exit_code or not result or not metadata:
+                with self.assertRaisesRegex(bc.BundleError,'failed_execution_preserved'):
+                    bc.publish('owner/private','bt-fixture','b'*40,'a'*40,out)
+            else:
+                bc.publish('owner/private','bt-fixture','b'*40,'a'*40,out)
+        return captured
+
+    def test_failure_keeps_prefix_and_receipt_without_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp);files=self.publish_fixture(out,exit_code=7)
+            prefix='transport/bundle-executions/bt-fixture/123-1/'
+            self.assertIn(prefix+'result.jsonl',files)
+            receipt=json.loads(files[prefix+'receipt.json'])
+            self.assertEqual(receipt['status'],'failed_or_partial')
+            self.assertEqual(receipt['result_rows'],2)
+            self.assertNotIn('transport/bundle-executions/bt-fixture/completed.json',files)
+            self.assertRegex(files['__recovery_ref__'],r'^recovery-actions-123-1-[0-9a-f]{12}$')
+
+    def test_success_still_requires_result_and_persists_complete_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files=self.publish_fixture(Path(tmp))
+            self.assertIn('transport/bundle-executions/bt-fixture/completed.json',files)
+        with tempfile.TemporaryDirectory() as tmp:
+            files=self.publish_fixture(Path(tmp),result=False)
+            self.assertNotIn('transport/bundle-executions/bt-fixture/completed.json',files)
+
+    def test_no_output_directory_still_gets_failure_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            files=self.publish_fixture(Path(tmp)/'absent',result=False,metadata=False)
+            self.assertIn('transport/bundle-executions/bt-fixture/123-1/receipt.json',files)
+
+    def test_large_pinned_blob_read_and_identity_rejection(self):
+        raw=b'x'*(2*1024*1024+3);blob=pio.blob_sha(raw)
+        metadata={'type':'file','encoding':'none','size':len(raw),'sha':blob}
+        response={'encoding':'base64','sha':blob,'size':len(raw),
+                  'content':base64.b64encode(raw).decode()}
+        with mock.patch.object(bc,'content',return_value=metadata), \
+             mock.patch.object(bc,'api',return_value=response) as get:
+            self.assertEqual(bc.read_pinned_file('owner/private','transport/executions/old/result.jsonl',
+                                               'f'*40,blob,bc.MAX_INPUT_FILE),raw)
+            self.assertEqual(get.call_args.args[0],'/repos/owner/private/git/blobs/'+blob)
+        with mock.patch.object(bc,'content',return_value={**metadata,'sha':'0'*40}), \
+             mock.patch.object(bc,'api') as get:
+            with self.assertRaisesRegex(bc.BundleError,'pinned_file_identity_mismatch'):
+                bc.read_pinned_file('owner/private','inputs/x','f'*40,blob,bc.MAX_INPUT_FILE)
+            get.assert_not_called()
+
+    def test_already_completed_bundle_skips_without_new_git_write(self):
+        code='print(1)\n';bundle={'schema':bc.SCHEMA,'bundle_id':'bt-fixture',
+            'files':{'run_task.py':code},'sha256':{'run_task.py':hashlib.sha256(code.encode()).hexdigest()}}
+        raw=json.dumps(bundle).encode();blob=pio.blob_sha(raw)
+        done=json.dumps({'bundle_blob':blob,'status':'materialized','source_ref':'c'*40}).encode()
+        def item(data):return {'type':'file','encoding':'base64','sha':pio.blob_sha(data),
+                               'content':base64.b64encode(data).decode()}
+        outputs={}
+        with mock.patch.object(bc,'content',side_effect=[item(raw),item(done)]), \
+             mock.patch.object(bc,'put_create_only') as put, \
+             mock.patch.object(bc,'append_output',side_effect=lambda k,v:outputs.update({k:v})):
+            bc.materialize('owner/private','bt-fixture')
+        self.assertEqual(outputs['skip'],'true');put.assert_not_called()
+
+    def test_retry_after_is_never_capped_to_an_early_retry(self):
+        error=urllib.error.HTTPError('u',429,'limited',{'Retry-After':'600'},None)
+        self.assertEqual(bc._retry_delay(error,0),600)
+        self.assertGreaterEqual(bc._retry_delay(urllib.error.HTTPError('u',429,'limited',{},None),0),60)
+
+    def test_recovery_ref_precedes_main_and_generic_422_does_not_retry(self):
+        missing=urllib.error.HTTPError('u',404,'missing',{},None);calls=[]
+        def api(path,method='GET',body=None):
+            calls.append((path,method))
+            if path.endswith('/git/ref/heads/main'):return {'object':{'sha':'parent'}}
+            if path.endswith('/git/blobs'):return {'sha':'blob'}
+            if path.endswith('/git/commits/parent'):return {'tree':{'sha':'base'}}
+            if path.endswith('/git/trees'):return {'sha':'tree'}
+            if path.endswith('/git/commits'):return {'sha':'commit'}
+            if path.endswith('/git/refs/heads/main'):return {'object':{'sha':'commit'}}
+            raise AssertionError(path)
+        def recover(repo,branch,commit):calls.append(('recovery','POST'))
+        with mock.patch.object(bc,'content',side_effect=missing),mock.patch.object(bc,'api',side_effect=api), \
+             mock.patch.object(pio,'_set_recovery_ref',side_effect=recover),mock.patch.object(pio,'_clear_recovery_ref'):
+            bc.put_create_only('owner/private',{'transport/x':b'fixture'},'fixture',
+                               recovery_ref='recovery-actions-123-1-0123456789ab')
+        self.assertLess(calls.index(('recovery','POST')),calls.index(('/repos/owner/private/git/refs/heads/main','PATCH')))
+        error=urllib.error.HTTPError('u',422,'invalid',{},None)
+        with mock.patch.object(bc,'api',side_effect=error) as api,mock.patch.object(bc.time,'sleep') as sleep:
+            with self.assertRaises(urllib.error.HTTPError):bc.put_create_only('owner/private',{'transport/x':b'x'},'x')
+            self.assertEqual(api.call_count,1);sleep.assert_not_called()
 
 
 if __name__ == "__main__":

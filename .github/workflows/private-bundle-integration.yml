@@ -144,6 +144,7 @@ jobs:
             --bundle-id "${{ needs.resolve.outputs.bundle_id }}"
 
       - name: Fetch immutable source and pinned private inputs
+        if: steps.materialize.outputs.skip != 'true'
         env:
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
@@ -156,6 +157,7 @@ jobs:
             --dest "$RUNNER_TEMP/bundle-task"
 
       - name: Execute in existing isolated candidate boundary
+        if: steps.materialize.outputs.skip != 'true'
         run: |
           set -euo pipefail
           rm -rf "$RUNNER_TEMP/bundle-output"
@@ -167,7 +169,7 @@ jobs:
 
       - name: Publish validated result only to private repository
         id: publish
-        if: always() && steps.materialize.outcome == 'success'
+        if: always() && steps.materialize.outcome == 'success' && steps.materialize.outputs.skip != 'true'
         env:
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
