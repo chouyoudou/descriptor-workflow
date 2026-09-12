@@ -1,0 +1,72 @@
+name: Private bundle qualification
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      ok: ${{ steps.resolve.outputs.ok }}
+      bundle_id: ${{ steps.resolve.outputs.bundle_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Resolve opaque owner-only issue trigger
+        id: resolve
+        run: python3 bundle_issue_probe_20260912.py resolve --event "$GITHUB_EVENT_PATH"
+
+  materialize-run-publish:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.ok == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PRIVATE_REPOSITORY: chouyoudou/descriptor-workflow-private
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Materialize validated bundle as immutable private source
+        id: materialize
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          python3 bundle_issue_probe_20260912.py materialize \
+            --repo "$PRIVATE_REPOSITORY" \
+            --bundle-id "${{ needs.resolve.outputs.bundle_id }}"
+
+      - name: Fetch only the immutable materialized source
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          python3 bundle_issue_probe_20260912.py fetch-source \
+            --repo "$PRIVATE_REPOSITORY" \
+            --bundle-id "${{ needs.resolve.outputs.bundle_id }}" \
+            --source-ref "${{ steps.materialize.outputs.source_ref }}" \
+            --dest "$RUNNER_TEMP/bundle-task"
+
+      - name: Execute synthetic source without private token
+        run: |
+          env -u PRIVATE_REPO_TOKEN \
+            python3 "$RUNNER_TEMP/bundle-task/run_task.py" \
+            --output "$RUNNER_TEMP/bundle-output"
+
+      - name: Publish validated probe result to private repository
+        id: publish
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          python3 bundle_issue_probe_20260912.py publish \
+            --repo "$PRIVATE_REPOSITORY" \
+            --bundle-id "${{ needs.resolve.outputs.bundle_id }}" \
+            --source-ref "${{ steps.materialize.outputs.source_ref }}" \
+            --bundle-blob "${{ steps.materialize.outputs.bundle_blob }}" \
+            --output "$RUNNER_TEMP/bundle-output"
