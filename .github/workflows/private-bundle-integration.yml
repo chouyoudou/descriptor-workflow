@@ -1,0 +1,180 @@
+name: Private bundle integration
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+
+env:
+  PRIVATE_REPOSITORY: chouyoudou/descriptor-workflow-private
+  PUBLIC_LOCK_SHA: 04c70a3a92a2e7ec98c017cf85be55eebe3242d03de4c86b7d0698b650935678
+  PYTHON_IMAGE: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      ok: ${{ steps.resolve.outputs.ok }}
+      bundle_id: ${{ steps.resolve.outputs.bundle_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Resolve opaque owner-only bundle trigger
+        id: resolve
+        run: python3 bundle_control.py resolve --event "$GITHUB_EVENT_PATH"
+
+  integrate:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.ok == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    concurrency:
+      group: private-bundle-${{ needs.resolve.outputs.bundle_id }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Derive content-addressed public runtime identity
+        id: profile
+        run: |
+          set -euo pipefail
+          python3 public_env/runtime_cache.py identity \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Restore verified public runtime image
+        id: runtime_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-runtime-cache
+          key: public-runtime-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.profile_digest }}
+
+      - name: Load and verify cached public runtime
+        id: runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.runtime_cache.outputs.cache-hit }}" = "true" ]; then
+            test -f .public-runtime-cache/runtime.tar
+            docker load -i .public-runtime-cache/runtime.tar >/dev/null
+            python3 public_env/runtime_cache.py verify-image \
+              --image descriptor-direct-runtime:current \
+              --lock public_env/resolved.lock \
+              --manifest public_env/wheel-manifest.lock.json \
+              --dockerfile public_env/runtime.Dockerfile \
+              --base-image "$PYTHON_IMAGE" \
+              --public-deps public_env/public_deps.py \
+              --json-output "$RUNNER_TEMP/runtime-cache-verification.json" >/dev/null
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "RUNTIME_STAGE=cache-hit-verified"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "RUNTIME_STAGE=cache-miss"
+          fi
+
+      - name: Restore content-addressed public wheelhouse
+        id: wheels_v2
+        if: steps.runtime.outputs.ready != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-v2-${{ runner.os }}-${{ runner.arch }}-cp312-${{ hashFiles('public_env/resolved.lock', 'public_env/wheel-manifest.lock.json') }}
+
+      - name: Restore exact legacy wheelhouse for one-way migration
+        id: wheels_v1
+        if: steps.runtime.outputs.ready != 'true' && steps.wheels_v2.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-v1-Linux-X64-cp312-${{ env.PUBLIC_LOCK_SHA }}
+
+      - name: Build and verify public runtime on cache miss
+        if: steps.runtime.outputs.ready != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 public_env/public_deps.py verify-lock \
+            public_env/resolved.lock "$PUBLIC_LOCK_SHA" 45
+          mkdir -p .public-wheelhouse
+          if [ "${{ steps.wheels_v2.outputs.cache-hit }}" != "true" ] && \
+             [ "${{ steps.wheels_v1.outputs.cache-hit }}" != "true" ]; then
+            python3 -m pip download --only-binary=:all: --no-deps \
+              --dest .public-wheelhouse -r public_env/resolved.lock --quiet
+          fi
+          python3 public_env/public_deps.py verify-wheelhouse \
+            .public-wheelhouse public_env/wheel-manifest.lock.json
+          build="$RUNNER_TEMP/bundle-runtime-build"
+          rm -rf "$build"
+          mkdir -m 0700 "$build"
+          cp -a .public-wheelhouse "$build/wheelhouse"
+          cp public_env/resolved.lock "$build/resolved.lock"
+          cp public_env/runtime.Dockerfile "$build/runtime.Dockerfile"
+          docker build \
+            -f "$build/runtime.Dockerfile" \
+            --build-arg BASE_IMAGE="$PYTHON_IMAGE" \
+            --build-arg PROFILE_DIGEST="${{ steps.profile.outputs.profile_digest }}" \
+            --build-arg LOCK_SHA256="${{ steps.profile.outputs.lock_sha256 }}" \
+            -t descriptor-direct-runtime:current "$build" >/dev/null
+          python3 public_env/runtime_cache.py verify-image \
+            --image descriptor-direct-runtime:current \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" \
+            --public-deps public_env/public_deps.py \
+            --json-output "$RUNNER_TEMP/runtime-build-verification.json" >/dev/null
+
+      - name: Materialize validated bundle as immutable private source
+        id: materialize
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 bundle_control.py materialize \
+            --repo "$PRIVATE_REPOSITORY" \
+            --bundle-id "${{ needs.resolve.outputs.bundle_id }}"
+
+      - name: Fetch immutable source and pinned private inputs
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/bundle-task"
+          python3 bundle_control.py fetch-task \
+            --repo "$PRIVATE_REPOSITORY" \
+            --bundle-id "${{ needs.resolve.outputs.bundle_id }}" \
+            --source-ref "${{ steps.materialize.outputs.source_ref }}" \
+            --dest "$RUNNER_TEMP/bundle-task"
+
+      - name: Execute in existing isolated candidate boundary
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/bundle-output"
+          python3 private_io.py execute \
+            --task-dir "$RUNNER_TEMP/bundle-task" \
+            --output "$RUNNER_TEMP/bundle-output" \
+            --image descriptor-direct-runtime:current \
+            --timeout "${{ steps.materialize.outputs.timeout_seconds }}"
+
+      - name: Publish validated result only to private repository
+        id: publish
+        if: always() && steps.materialize.outcome == 'success'
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 bundle_control.py publish \
+            --repo "$PRIVATE_REPOSITORY" \
+            --bundle-id "${{ needs.resolve.outputs.bundle_id }}" \
+            --source-ref "${{ steps.materialize.outputs.source_ref }}" \
+            --bundle-blob "${{ steps.materialize.outputs.bundle_blob }}" \
+            --output "$RUNNER_TEMP/bundle-output"
