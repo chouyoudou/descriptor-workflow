@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  PUBLIC_LOCK_SHA256: 04c70a3a92a2e7ec98c017cf85be55eebe3242d03de4c86b7d0698b650935678
+  PUBLIC_LOCK_SHA256: 2cd687069fe7283471ff171f26a0e9b745604fef95fbf28cb1c10ce28efa5d11
   PYTHON_IMAGE: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
 
 jobs:
@@ -69,7 +69,7 @@ jobs:
             mode="cache-hit"
           else
             python3 public_env/public_deps.py verify-lock \
-              public_env/resolved.lock "$PUBLIC_LOCK_SHA256" 45 >/dev/null
+              public_env/resolved.lock "$PUBLIC_LOCK_SHA256" 50 >/dev/null
             mkdir -p .public-wheelhouse
             if [ "${{ steps.wheels_v2.outputs.cache-hit }}" != "true" ] && \
                [ "${{ steps.wheels_v1.outputs.cache-hit }}" != "true" ]; then

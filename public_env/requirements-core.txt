@@ -5,3 +5,10 @@ pymatgen==2026.5.4
 numpy==2.5.3
 scipy==1.18.1
 spglib==2.7.0
+
+# Public native-reference execution dependencies; existing scientific pins unchanged.
+pyscal3==3.3.2
+pybind11==3.0.1
+ase==3.26.0
+PyYAML==6.0.2
+pyvoro2==0.8.0

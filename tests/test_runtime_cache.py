@@ -4,11 +4,26 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from public_env import public_deps
 
 from public_env import runtime_cache as rc
 
 
 class RuntimeCacheTests(unittest.TestCase):
+    def test_missing_compiler_does_not_pass_native_readiness(self):
+        with patch.object(public_deps.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(SystemExit, "compiler is missing"):
+                public_deps.compiler_smoke()
+
+    def test_failed_header_check_does_not_pass_native_readiness(self):
+        from types import SimpleNamespace
+        with patch.object(public_deps.shutil, "which", return_value="/usr/bin/g++"), \
+             patch.object(public_deps.subprocess, "run",
+                          return_value=SimpleNamespace(returncode=1)):
+            with self.assertRaisesRegex(SystemExit, "header compilation failed"):
+                public_deps.compiler_smoke()
+
     def _files(self, root: Path):
         lock = root / "resolved.lock"
         manifest = root / "manifest.json"

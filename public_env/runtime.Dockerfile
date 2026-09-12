@@ -8,6 +8,9 @@ LABEL org.opencontainers.image.source="https://github.com/chouyoudou/descriptor-
       io.descriptor.runtime.profile-digest="${PROFILE_DIGEST}" \
       io.descriptor.runtime.lock-sha256="${LOCK_SHA256}" \
       io.descriptor.runtime.base-image="${BASE_IMAGE}"
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ make \
+    && rm -rf /var/lib/apt/lists/*
 COPY wheelhouse /wheelhouse
 COPY resolved.lock /tmp/resolved.lock
 RUN python3 -m pip install --no-index --find-links=/wheelhouse \

@@ -8,6 +8,8 @@ from importlib import metadata
 import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 
 PIN_RE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s=]+)$")
@@ -101,6 +103,49 @@ def verify_installed(lock_path: Path) -> dict[str, object]:
     }
 
 
+def compiler_smoke() -> str:
+    """Check public C++ headers/toolchain without executing private code."""
+    compiler = shutil.which("g++")
+    if compiler is None:
+        raise SystemExit("native-reference C++ compiler is missing")
+    result = subprocess.run(
+        [compiler, "-x", "c++", "-std=c++11", "-fsyntax-only", "-"],
+        input="#include <vector>\nint main(){std::vector<int> x{1};return x[0]-1;}\n",
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+    if result.returncode:
+        raise SystemExit("native-reference C++ header compilation failed")
+    return subprocess.run(
+        [compiler, "--version"], text=True, capture_output=True,
+        check=True, timeout=10,
+    ).stdout.splitlines()[0]
+
+
+def native_reference_smoke() -> dict[str, object]:
+    """Only upstream APIs on public ideal cells, not research descriptors."""
+    import numpy as np
+    from pyscal3 import System
+    from pyvoro2 import PeriodicCell, compute
+
+    system = System.create.lattice.fcc(lattice_constant=3.6, repetitions=[2, 2, 2])
+    classes = system.analyze.common_neighbor_analysis()
+    if classes["fcc"] <= 0 or classes["fcc"] != sum(classes.values()):
+        raise SystemExit("public ideal-fcc native classification failed")
+    voronoi = compute([[0.0, 0.0, 0.0]], domain=PeriodicCell(vectors=2*np.eye(3)))
+    if len(voronoi.cells) != 1 or len(voronoi.cells[0]["faces"]) != 6:
+        raise SystemExit("public cubic native tessellation failed")
+    if not np.allclose(voronoi.cell_measures, [8.0], rtol=1e-12, atol=1e-12):
+        raise SystemExit("public cubic native volume failed")
+    return {
+        "synthetic_only": True,
+        "packages": {name: metadata.version(name)
+                     for name in ("pyscal3", "pyvoro2", "ase", "PyYAML", "pybind11")},
+        "native_classification_executed": True,
+        "native_tessellation_executed": True,
+        "compiler": compiler_smoke(),
+    }
+
+
 def smoke() -> dict[str, object]:
     import numpy as np
     import scipy
@@ -126,6 +171,7 @@ def smoke() -> dict[str, object]:
         "fingerprint_coordinates": int(values.size),
         "finite_coordinates": int(np.isfinite(values).sum()),
         "synthetic_only": True,
+        "native_reference": native_reference_smoke(),
     }
 
 
