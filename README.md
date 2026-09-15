@@ -52,10 +52,19 @@ orthorhombic and skew cells.
 | [`public_env/`](public_env/) | Pinned dependencies and reusable Docker runtime caching. |
 | [`request_contract.py`](request_contract.py) | Validation of job requests and execution slots. |
 | [`private_io.py`](private_io.py) | Optional authenticated repository I/O for separately managed job inputs and results. |
+| [`bundle_control.py`](bundle_control.py) | Immutable source-bundle materialization and result publication. |
 
 The Actions workflows cover public tests, runtime preparation, and configured
 integration jobs. Docker is required for container-based execution; the
 standalone geometry example does not need it.
+
+The integration bridge accepts both pre-hashed `private-task-bundle/2` requests
+and text-first `private-task-bundle/3` requests. For text-first requests, the
+workflow derives source checksums from the received UTF-8 text, records them in
+the immutable source manifest and verifies them again before execution. Any
+client-supplied checksums are still checked. This avoids requiring callers to
+maintain a second copy of source identity while preserving exact-byte replay.
+Existing input pinning, resource limits and publication rules are unchanged.
 
 ## Tests
 

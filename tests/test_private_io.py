@@ -364,5 +364,95 @@ class BundleRecoveryTests(unittest.TestCase):
             self.assertEqual(api.call_count,1);sleep.assert_not_called()
 
 
+class TextBundleIdentityTests(unittest.TestCase):
+    def bundle(self):
+        return {"schema": bc.TEXT_SCHEMA, "bundle_id": "bt-text-fixture",
+                "files": {"run_task.py": "\n# Unicode: 晶体\nprint('ok')\n"},
+                "inputs": {}, "timeout_seconds": 30}
+
+    def item(self, data):
+        return {"type": "file", "encoding": "base64", "sha": pio.blob_sha(data),
+                "content": base64.b64encode(data).decode()}
+
+    def test_v2_still_requires_exact_manifest_v3_preserves_text(self):
+        bundle = self.bundle()
+        raw = json.dumps(bundle).encode()
+        _, sources, _, _ = bc.validate_bundle(raw, bundle["bundle_id"])
+        self.assertEqual(sources["run_task.py"], bundle["files"]["run_task.py"].encode())
+        bundle["schema"] = bc.SCHEMA
+        with self.assertRaisesRegex(bc.BundleError, "invalid_source_manifest"):
+            bc.validate_bundle(json.dumps(bundle), bundle["bundle_id"])
+        code = bundle["files"]["run_task.py"]
+        bundle["sha256"] = {"run_task.py": hashlib.sha256(code.lstrip().encode()).hexdigest()}
+        with self.assertRaisesRegex(bc.BundleError, "source_hash_mismatch"):
+            bc.validate_bundle(json.dumps(bundle), bundle["bundle_id"])
+        bundle["sha256"]["run_task.py"] = hashlib.sha256(code.encode()).hexdigest()
+        self.assertEqual(bc.validate_bundle(json.dumps(bundle), bundle["bundle_id"])[1], sources)
+
+    def test_v3_declared_hashes_are_not_ignored_and_limits_remain(self):
+        for hashes in (None, {}, {"run_task.py": "0" * 64}):
+            bundle = self.bundle(); bundle["sha256"] = hashes
+            with self.subTest(hashes=hashes), self.assertRaises(bc.BundleError):
+                bc.validate_bundle(json.dumps(bundle), bundle["bundle_id"])
+        for files in ({"run_task.py": "x" * (bc.MAX_SOURCE_FILE + 1)},
+                      {"run_task.py": "", "../escape.py": ""},
+                      {"run_task.py": "", "BUNDLE_SOURCE.json": ""}):
+            bundle = self.bundle(); bundle["files"] = files
+            with self.subTest(files=list(files)), self.assertRaises(bc.BundleError):
+                bc.validate_bundle(json.dumps(bundle), bundle["bundle_id"])
+        bundle = self.bundle()
+        bundle["inputs"] = {"x": {"path": "outside/asset", "ref": "a"*40, "blob": "b"*40}}
+        with self.assertRaisesRegex(bc.BundleError, "input_path_not_allowed"):
+            bc.validate_bundle(json.dumps(bundle), bundle["bundle_id"])
+
+    def test_v3_host_derives_manifest_and_fetch_rechecks_exact_source(self):
+        bundle = self.bundle(); raw = json.dumps(bundle).encode()
+        path = "transport/bundle_inbox/" + bundle["bundle_id"] + ".json"
+        stored = {path: raw}; outputs = {}; ref = "a" * 40
+        def content(repo, name, revision):
+            if name not in stored:
+                raise urllib.error.HTTPError("u", 404, "missing", {}, None)
+            return self.item(stored[name])
+        def put(repo, files, message, recovery_ref=None):
+            stored.update(files); return ref
+        with mock.patch.object(bc, "content", side_effect=content), \
+             mock.patch.object(bc, "put_create_only", side_effect=put), \
+             mock.patch.object(bc, "append_output", side_effect=lambda k,v: outputs.update({k:v})):
+            bc.materialize("owner/private", bundle["bundle_id"])
+            prefix = "transport/tasks/bundle-materialized/" + bundle["bundle_id"] + "/"
+            manifest = json.loads(stored[prefix + "BUNDLE_SOURCE.json"])
+            code = bundle["files"]["run_task.py"].encode()
+            self.assertEqual(manifest["files"]["run_task.py"], hashlib.sha256(code).hexdigest())
+            self.assertEqual(manifest["bundle_blob"], pio.blob_sha(raw))
+            self.assertEqual(manifest["submission_schema"], bc.TEXT_SCHEMA)
+            self.assertEqual(manifest["source_hash_authority"], "actions_received_utf8")
+            with tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / "task"
+                bc.fetch_task("owner/private", bundle["bundle_id"], ref, target)
+                self.assertEqual((target / "run_task.py").read_bytes(), code)
+                stored[prefix + "run_task.py"] = code + b"# altered\n"
+                with self.assertRaisesRegex(bc.BundleError, "source_fetch_hash_mismatch"):
+                    bc.fetch_task("owner/private", bundle["bundle_id"], ref, Path(tmp) / "bad")
+        self.assertEqual(outputs["skip"], "false")
+
+    def test_completed_v3_skips_but_changed_same_id_is_rejected(self):
+        bundle = self.bundle(); raw = json.dumps(bundle).encode()
+        done = json.dumps({"bundle_blob": pio.blob_sha(raw), "status": "materialized",
+                           "source_ref": "c"*40}).encode()
+        outputs = {}
+        with mock.patch.object(bc, "content", side_effect=[self.item(raw), self.item(done)]), \
+             mock.patch.object(bc, "put_create_only") as put, \
+             mock.patch.object(bc, "append_output", side_effect=lambda k,v: outputs.update({k:v})):
+            bc.materialize("owner/private", bundle["bundle_id"])
+            put.assert_not_called()
+        self.assertEqual(outputs["skip"], "true")
+        bundle["files"]["run_task.py"] += "# different\n"
+        with mock.patch.object(bc, "content", side_effect=[self.item(json.dumps(bundle).encode()), self.item(done)]), \
+             mock.patch.object(bc, "put_create_only") as put:
+            with self.assertRaisesRegex(bc.BundleError, "completed_bundle_identity_changed"):
+                bc.materialize("owner/private", bundle["bundle_id"])
+            put.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

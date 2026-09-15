@@ -25,6 +25,7 @@ FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 REF_RE = re.compile(r"^[0-9a-f]{40}$")
 BLOB_RE = re.compile(r"^[0-9a-f]{40}$")
 SCHEMA = "private-task-bundle/2"
+TEXT_SCHEMA = "private-task-bundle/3"
 TRIGGER_SCHEMA = "private-bundle-trigger/2"
 SOURCE_SCHEMA = "bundle-materialized-source/2"
 ALLOWED_INPUT_PREFIXES = (
@@ -153,15 +154,23 @@ def validate_bundle(raw, bundle_id):
         b = json.loads(raw)
     except Exception as exc:
         raise BundleError("invalid_bundle_json") from exc
-    if b.get("schema") != SCHEMA or b.get("bundle_id") != bundle_id:
+    if (not isinstance(b, dict) or b.get("schema") not in (SCHEMA, TEXT_SCHEMA)
+            or b.get("bundle_id") != bundle_id):
         raise BundleError("bundle_identity_mismatch")
 
     files = b.get("files")
     hashes = b.get("sha256")
     if not isinstance(files, dict) or not 1 <= len(files) <= MAX_SOURCE_FILES:
         raise BundleError("invalid_source_files")
-    if "run_task.py" not in files or not isinstance(hashes, dict) or set(hashes) != set(files):
+    if "run_task.py" not in files:
         raise BundleError("invalid_source_manifest")
+    # V2 retains its exact declared-hash contract. V3 can omit the redundant
+    # client-computed manifest: the immutable Git bundle binds the received
+    # text, and materialize/fetch_task derive and verify its exact UTF-8 bytes.
+    # If a V3 client DOES declare hashes, contradictions still fail closed.
+    if b["schema"] == SCHEMA or "sha256" in b:
+        if not isinstance(hashes, dict) or set(hashes) != set(files):
+            raise BundleError("invalid_source_manifest")
     total = 0
     sources = {}
     for name, text in files.items():
@@ -172,7 +181,7 @@ def validate_bundle(raw, bundle_id):
         total += len(data)
         if len(data) > MAX_SOURCE_FILE or total > MAX_SOURCE_TOTAL:
             raise BundleError("source_too_large")
-        if hashlib.sha256(data).hexdigest() != hashes.get(name):
+        if hashes is not None and hashlib.sha256(data).hexdigest() != hashes.get(name):
             raise BundleError("source_hash_mismatch:" + name)
         sources[name] = data
 
@@ -318,6 +327,9 @@ def materialize(repo, bundle_id):
         "inputs": inputs,
         "timeout_seconds": timeout_seconds,
     }
+    if bundle["schema"] == TEXT_SCHEMA:
+        source_manifest["submission_schema"] = TEXT_SCHEMA
+        source_manifest["source_hash_authority"] = "actions_received_utf8"
     formal = {f"{prefix}/{name}": data for name, data in sources.items()}
     formal[f"{prefix}/BUNDLE_SOURCE.json"] = (
         json.dumps(source_manifest, indent=2, sort_keys=True) + "\n"
