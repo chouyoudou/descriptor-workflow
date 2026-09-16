@@ -230,6 +230,30 @@ class RecoveryRefTests(unittest.TestCase):
 
 
 class CandidateCpuBudgetTests(unittest.TestCase):
+    def test_cleanup_timeout_preserves_result_and_failure_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);task=root/'task';task.mkdir();out=root/'out'
+            result=SimpleNamespace(stdout=b'',stderr=b'',child_exit_code=0,timed_out=False,output_limit_exceeded=False)
+            def run(*a,**k):
+                (out/'result.jsonl').write_text('{"id":"preserved"}\n')
+                return result
+            calls=[SimpleNamespace(returncode=0,stderr=b''),pio.subprocess.TimeoutExpired(['docker','rm'],15)]
+            with mock.patch.dict(pio.os.environ,{'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}),mock.patch.object(pio.subprocess,'run',side_effect=calls) as docker,mock.patch('restricted_exec.run_bounded',side_effect=run):
+                with self.assertRaises(pio.PrivateIOError):pio.execute(task,out,'public-runtime:test',30)
+            self.assertEqual((out/'result.jsonl').read_text(),'{"id":"preserved"}\n')
+            status=json.loads((out/'execution.json').read_text())
+            self.assertTrue(status['cleanup_timed_out']);self.assertEqual(status['candidate_exit_code'],0);self.assertNotEqual(status['exit_code'],0)
+            self.assertEqual([c.kwargs['timeout'] for c in docker.call_args_list],[30,15])
+
+    def test_create_timeout_still_produces_typed_execution_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);task=root/'task';task.mkdir();out=root/'out'
+            calls=[pio.subprocess.TimeoutExpired(['docker','create'],30),SimpleNamespace(returncode=1,stderr=b'')]
+            with mock.patch.dict(pio.os.environ,{'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}),mock.patch.object(pio.subprocess,'run',side_effect=calls),mock.patch('restricted_exec.run_bounded') as run:
+                with self.assertRaises(pio.PrivateIOError):pio.execute(task,out,'public-runtime:test',30)
+                run.assert_not_called()
+            status=json.loads((out/'execution.json').read_text());self.assertTrue(status['timed_out']);self.assertEqual(status['host_failure_class'],'TimeoutExpired');self.assertNotEqual(status['exit_code'],0)
+
     def test_four_cpu_budget_and_worker_hint_without_nested_blas_threads(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
