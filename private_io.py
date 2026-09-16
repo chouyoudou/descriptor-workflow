@@ -297,21 +297,48 @@ def execute(task_dir, output_dir, image, timeout):
            "--mount", f"type=bind,src={out.resolve()},dst=/output",
            "--workdir", "/task", image, "python3", "-B", "/task/run_task.py", "--output", "/output"]
     result = None
+    failure = None
+    creation_stderr = b''
+    cleanup_failed = False
     try:
-        created = subprocess.run(cmd, capture_output=True, check=False)
+        created = subprocess.run(cmd, capture_output=True, check=False, timeout=30)
         if created.returncode:
-            (out / "execution.stderr.log").write_bytes(created.stderr)
+            creation_stderr = created.stderr[:1048576]
             raise PrivateIOError("container_create_failed")
+        print("EXECUTION_STAGE=candidate-start", flush=True)
         result = run_bounded(["docker", "start", "-a", name],
                              timeout_seconds=timeout, max_output_bytes=1048576)
+        print("EXECUTION_STAGE=candidate-returned", flush=True)
+    except Exception as exc:
+        failure = exc
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
-    (out / "execution.stdout.log").write_bytes(result.stdout)
-    (out / "execution.stderr.log").write_bytes(result.stderr)
-    status = {"exit_code": result.child_exit_code, "timed_out": result.timed_out,
-              "output_limit_exceeded": result.output_limit_exceeded}
-    write_json(out / "execution.json", status)
-    if result.child_exit_code != 0 or result.timed_out or result.output_limit_exceeded:
+        # Preserve exit facts before asking the daemon to clean up. A hung
+        # control call must not block private publication of durable prefixes.
+        status = {"exit_code": result.child_exit_code if result else 125,
+                  "timed_out": result.timed_out if result else isinstance(failure, subprocess.TimeoutExpired),
+                  "output_limit_exceeded": result.output_limit_exceeded if result else False,
+                  "host_failure_class": type(failure).__name__ if failure else None}
+        (out / "execution.stdout.log").write_bytes(result.stdout if result else b'')
+        (out / "execution.stderr.log").write_bytes(result.stderr if result else creation_stderr)
+        write_json(out / "execution.json", status)
+        try:
+            cleanup = subprocess.run(["docker", "rm", "-f", name],
+                                     capture_output=True, check=False, timeout=15)
+            cleanup_failed = cleanup.returncode != 0
+            status['cleanup_timed_out'] = False
+        except subprocess.TimeoutExpired:
+            cleanup_failed = True
+            status['cleanup_timed_out'] = True
+        except Exception as exc:
+            cleanup_failed = True
+            status['cleanup_failure_class'] = type(exc).__name__
+        status['cleanup_failed'] = cleanup_failed
+        if cleanup_failed:
+            status['candidate_exit_code'] = status['exit_code']
+            status['exit_code'] = 125
+        write_json(out / "execution.json", status)
+        print("EXECUTION_STAGE=cleanup-failed" if cleanup_failed else "EXECUTION_STAGE=cleanup-complete", flush=True)
+    if failure is not None or cleanup_failed or result is None or result.child_exit_code != 0 or result.timed_out or result.output_limit_exceeded:
         raise PrivateIOError("candidate_failed")
     print("COMPUTE_STAGE=complete")
 
