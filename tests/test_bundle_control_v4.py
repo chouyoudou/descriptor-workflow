@@ -113,9 +113,9 @@ class SourceLimitRemovalTests(unittest.TestCase):
         first = [{"filename": f"p/{i}.py"} for i in range(100)]
         second = [{"filename": f"p/{i}.py"} for i in range(100, 137)]
         def api(path, method="GET", body=None, max_response_bytes=64 * 1024 * 1024):
-            if "page=1" in path:
+            if path.endswith("&page=1"):
                 return {"sha": ref, "files": first}
-            if "page=2" in path:
+            if path.endswith("&page=2"):
                 return {"sha": ref, "files": second}
             raise AssertionError(path)
         with mock.patch.object(bc, "api", side_effect=api):
