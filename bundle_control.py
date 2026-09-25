@@ -376,7 +376,7 @@ def put_create_only(repo, files, message, recovery_ref=None, known_blob_shas=Non
     for path, raw in files.items():
         known = known_blob_shas.get(path)
         if known is not None:
-            expected = hashlib.sha1(f"blob {len(raw)}\\0".encode() + raw).hexdigest()
+            expected = hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest()
             if not BLOB_RE.fullmatch(known) or known != expected:
                 raise BundleError("known_blob_identity_mismatch:" + path)
             blob_shas[path] = known
