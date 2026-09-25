@@ -229,6 +229,62 @@ class RecoveryRefTests(unittest.TestCase):
         self.assertLess(main_move_index, clear_ref_index)
 
 
+class ProgressDiagnosticsTests(unittest.TestCase):
+    def test_valid_progress_summary_reports_median_slowest_and_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "progress.jsonl"
+            rows = [
+                {"schema":"descriptor-progress/1","processed":1,"total":4,
+                 "elapsed_seconds":2.0,"last_id":"a","item_seconds":2.0},
+                {"schema":"descriptor-progress/1","processed":2,"total":4,
+                 "elapsed_seconds":5.0,"last_id":"b","item_seconds":3.0},
+                {"schema":"descriptor-progress/1","processed":3,"total":4,
+                 "elapsed_seconds":9.0,"last_id":"c","item_seconds":4.0},
+            ]
+            p.write_text("".join(json.dumps(r)+"\n" for r in rows), encoding="utf-8")
+            got = pio.inspect_progress_jsonl(
+                p, {"timed_out": True, "wall_seconds": 12.5}
+            )
+            self.assertEqual(got["status"], "valid")
+            self.assertEqual(got["records"], 3)
+            self.assertEqual(got["processed"], 3)
+            self.assertEqual(got["total"], 4)
+            self.assertEqual(got["last_id"], "c")
+            self.assertEqual(got["median_item_seconds"], 3.0)
+            self.assertEqual(got["slowest_item_seconds"], 4.0)
+            self.assertEqual(got["slowest_id"], "c")
+            self.assertAlmostEqual(got["seconds_since_last_progress"], 3.5)
+            self.assertEqual(got["timeout_pattern"], "timeout_recent_progress")
+
+    def test_truncated_final_progress_line_preserves_prior_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "progress.jsonl"
+            p.write_text(
+                json.dumps({"schema":"descriptor-progress/1","processed":1,"total":3,
+                            "elapsed_seconds":1.5,"last_id":"a","item_seconds":1.5})+"\n"+
+                '{"schema":"descriptor-progress/1","processed":2',
+                encoding="utf-8",
+            )
+            got = pio.inspect_progress_jsonl(
+                p, {"timed_out": True, "wall_seconds": 130.0}
+            )
+            self.assertEqual(got["status"], "partial")
+            self.assertTrue(got["truncated_final_line"])
+            self.assertEqual(got["records"], 1)
+            self.assertEqual(got["processed"], 1)
+            self.assertEqual(got["last_id"], "a")
+            self.assertEqual(got["timeout_pattern"], "timeout_long_gap_since_progress")
+
+    def test_timeout_without_progress_is_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            got = pio.inspect_progress_jsonl(
+                Path(tmp) / "missing.jsonl",
+                {"timed_out": True, "wall_seconds": 30.0},
+            )
+            self.assertEqual(got["status"], "missing")
+            self.assertEqual(got["timeout_pattern"], "timeout_no_progress_records")
+
+
 class CandidateCpuBudgetTests(unittest.TestCase):
     def test_cleanup_timeout_preserves_result_and_failure_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -272,6 +328,12 @@ class CandidateCpuBudgetTests(unittest.TestCase):
             self.assertIn("DESCRIPTOR_WORKERS=4", command)
             self.assertIn("OPENBLAS_NUM_THREADS=1", command)
             self.assertIn("OMP_NUM_THREADS=1", command)
+            self.assertIn("DESCRIPTOR_PROGRESS_PATH=/output/progress.jsonl", command)
+            self.assertIn("DESCRIPTOR_TIMEOUT_SECONDS=30", command)
+            status = json.loads((root / "out" / "execution.json").read_text())
+            self.assertTrue(status["candidate_started"])
+            self.assertEqual(status["timeout_budget_seconds"], 30)
+            self.assertGreaterEqual(status["wall_seconds"], 0)
             self.assertFalse(any("PRIVATE_REPO_TOKEN" in argument for argument in command))
 
 
@@ -307,6 +369,43 @@ class BundleRecoveryTests(unittest.TestCase):
             self.assertEqual(receipt['result_rows'],2)
             self.assertNotIn('transport/bundle-executions/bt-fixture/completed.json',files)
             self.assertRegex(files['__recovery_ref__'],r'^recovery-actions-123-1-[0-9a-f]{12}$')
+
+    def test_timeout_progress_is_preserved_and_summarized_in_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            _write_success_metadata(out, rows=2)
+            (out / "execution.json").write_text(json.dumps({
+                "exit_code":124,"timed_out":True,"output_limit_exceeded":False,
+                "candidate_started":True,"wall_seconds":1800.0,
+                "timeout_budget_seconds":1800})+"\n")
+            (out / "focused-and-batch.log").write_text("fixture only\n")
+            (out / "result.jsonl").write_text('{"id":"a"}\n{"id":"b"}\n')
+            progress = [
+                {"schema":"descriptor-progress/1","processed":1,"total":10,
+                 "elapsed_seconds":2.0,"last_id":"a","item_seconds":2.0},
+                {"schema":"descriptor-progress/1","processed":2,"total":10,
+                 "elapsed_seconds":5.0,"last_id":"b","item_seconds":3.0},
+            ]
+            (out / "progress.jsonl").write_text(
+                "".join(json.dumps(x)+"\n" for x in progress)
+            )
+            captured={}
+            def put(repo,files,message,recovery_ref=None):
+                captured.update(files); return "c"*40
+            with mock.patch.object(bc,"put_create_only",side_effect=put), \
+                 mock.patch.dict(bc.os.environ,{"GITHUB_RUN_ID":"123","GITHUB_RUN_ATTEMPT":"1"}):
+                with self.assertRaisesRegex(bc.BundleError,"failed_execution_preserved"):
+                    bc.publish("owner/private","bt-fixture","b"*40,"a"*40,out)
+            prefix="transport/bundle-executions/bt-fixture/123-1/"
+            self.assertIn(prefix+"progress.jsonl",captured)
+            receipt=json.loads(captured[prefix+"receipt.json"])
+            self.assertEqual(receipt["progress"]["processed"],2)
+            self.assertEqual(receipt["progress"]["last_id"],"b")
+            self.assertEqual(receipt["progress"]["median_item_seconds"],2.5)
+            self.assertEqual(
+                receipt["progress"]["timeout_pattern"],
+                "timeout_long_gap_since_progress",
+            )
 
     def test_success_still_requires_result_and_persists_complete_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:
