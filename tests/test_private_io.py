@@ -413,13 +413,24 @@ class TextBundleIdentityTests(unittest.TestCase):
         bundle["sha256"]["run_task.py"] = hashlib.sha256(code.encode()).hexdigest()
         self.assertEqual(bc.validate_bundle(json.dumps(bundle), bundle["bundle_id"])[1], sources)
 
-    def test_v3_declared_hashes_are_not_ignored_and_limits_remain(self):
+    def test_v3_hash_and_path_safety_remain_but_source_caps_are_removed(self):
         for hashes in (None, {}, {"run_task.py": "0" * 64}):
             bundle = self.bundle(); bundle["sha256"] = hashes
             with self.subTest(hashes=hashes), self.assertRaises(bc.BundleError):
                 bc.validate_bundle(json.dumps(bundle), bundle["bundle_id"])
-        for files in ({"run_task.py": "x" * (bc.MAX_SOURCE_FILE + 1)},
-                      {"run_task.py": "", "../escape.py": ""},
+
+        # Former project caps (12 files, 128 KiB/file, 512 KiB total, ~1 MiB
+        # bundle envelope) are deliberately gone. Platform limits now govern.
+        bundle = self.bundle()
+        bundle["files"] = {"run_task.py": "x" * (1024 * 1024 + 17)}
+        bundle["files"].update({f"module_{i}.py": "y" * 4096 for i in range(20)})
+        raw = json.dumps(bundle).encode()
+        self.assertGreater(len(raw), 1024 * 1024)
+        parsed = bc.validate_bundle(raw, bundle["bundle_id"])[1]
+        self.assertEqual(len(parsed), 21)
+        self.assertEqual(len(parsed["run_task.py"]), 1024 * 1024 + 17)
+
+        for files in ({"run_task.py": "", "../escape.py": ""},
                       {"run_task.py": "", "BUNDLE_SOURCE.json": ""}):
             bundle = self.bundle(); bundle["files"] = files
             with self.subTest(files=list(files)), self.assertRaises(bc.BundleError):

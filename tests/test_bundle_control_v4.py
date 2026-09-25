@@ -66,6 +66,64 @@ class BundleV4ValidationTests(unittest.TestCase):
                     bc.validate_bundle(json.dumps(spec), "bt-v4-invalid")
 
 
+class SourceLimitRemovalTests(unittest.TestCase):
+    def test_v4_changed_and_final_tree_exceed_old_caps(self):
+        ref = "9" * 40
+        changed = {"big.py": "z" * (256 * 1024)}
+        changed.update({f"m{i}.py": "v = %d\n" % i for i in range(20)})
+        spec = {
+            "schema": bc.SUCCESSOR_SCHEMA,
+            "bundle_id": "bt-v4-large-unit",
+            "base_source_ref": ref,
+            "changed_files": changed,
+            "delete_files": [],
+            "inputs": {},
+            "timeout_seconds": 30,
+        }
+        _, encoded, _, _ = bc.validate_bundle(json.dumps(spec), "bt-v4-large-unit")
+        self.assertEqual(len(encoded), 21)
+        base = {"run_task.py": b"print('ok')\n"}
+        final, meta = bc._apply_successor_sources(base, encoded, [])
+        self.assertEqual(len(final), 22)
+        self.assertEqual(len(final["big.py"]), 256 * 1024)
+        self.assertEqual(len(meta["actual_changed_files"]), 21)
+
+    def test_large_repository_file_falls_back_to_git_blob_without_local_cap(self):
+        raw = b"x" * (1024 * 1024 + 123)
+        blob = git_blob(raw)
+        metadata = {
+            "type": "file", "encoding": "none", "sha": blob, "size": len(raw)
+        }
+        blob_response = {
+            "encoding": "base64",
+            "content": base64.b64encode(raw).decode(),
+            "sha": blob,
+        }
+        with mock.patch.object(bc, "content", return_value=metadata), \
+             mock.patch.object(bc, "api", return_value=blob_response) as api:
+            got, got_blob = bc.read_repository_file(
+                "owner/private", "transport/x.py", "a" * 40
+            )
+        self.assertEqual(got_blob, blob)
+        self.assertEqual(got, raw)
+        self.assertEqual(api.call_args.kwargs["max_response_bytes"], None)
+
+    def test_commit_file_pagination_has_no_local_source_count_cap(self):
+        ref = "8" * 40
+        first = [{"filename": f"p/{i}.py"} for i in range(100)]
+        second = [{"filename": f"p/{i}.py"} for i in range(100, 137)]
+        def api(path, method="GET", body=None, max_response_bytes=64 * 1024 * 1024):
+            if path.endswith("&page=1"):
+                return {"sha": ref, "files": first}
+            if path.endswith("&page=2"):
+                return {"sha": ref, "files": second}
+            raise AssertionError(path)
+        with mock.patch.object(bc, "api", side_effect=api):
+            files = bc._commit_files("owner/private", ref)
+        self.assertEqual(len(files), 137)
+        self.assertEqual(files[-1]["filename"], "p/136.py")
+
+
 class SuccessorCompositionTests(unittest.TestCase):
     def test_overlay_delete_inherit_and_noop_detection(self):
         base = {

@@ -40,10 +40,7 @@ ALLOWED_INPUT_PREFIXES = (
     "transport/recovered/",
     "transport/tasks/",
 )
-MAX_SOURCE_FILES = 12
 MAX_INPUT_FILES = 16
-MAX_SOURCE_FILE = 128 * 1024
-MAX_SOURCE_TOTAL = 512 * 1024
 MAX_INPUT_FILE = 32 * 1024 * 1024
 MAX_INPUT_TOTAL = 96 * 1024 * 1024
 MAX_OUTPUT_FILE = 32 * 1024 * 1024
@@ -79,7 +76,7 @@ def _retry_delay(exc, attempt):
         return 60 * 2 ** attempt
     return min(2 ** attempt, 16) + random.uniform(0.0, 0.4)
 
-def api(path, method="GET", body=None):
+def api(path, method="GET", body=None, max_response_bytes=64 * 1024 * 1024):
     token = os.environ.get("PRIVATE_REPO_TOKEN", "").strip()
     headers = {
         "Accept": "application/vnd.github+json",
@@ -96,9 +93,12 @@ def api(path, method="GET", body=None):
     )
     from private_io import NoRedirect
     with urllib.request.build_opener(NoRedirect).open(req, timeout=30) as response:
-        raw = response.read(64 * 1024 * 1024 + 1)
-        if len(raw) > 64 * 1024 * 1024:
-            raise BundleError("response_too_large")
+        if max_response_bytes is None:
+            raw = response.read()
+        else:
+            raw = response.read(max_response_bytes + 1)
+            if len(raw) > max_response_bytes:
+                raise BundleError("response_too_large")
         return None if not raw else json.loads(raw)
 
 def content(repo, path, ref):
@@ -106,30 +106,43 @@ def content(repo, path, ref):
     rr = urllib.parse.quote(ref, safe="")
     return api(f"/repos/{safe_repo(repo)}/contents/{q}?ref={rr}")
 
-def decode_contents(item, limit):
+def decode_contents(item, limit=None):
     if item.get("type") != "file" or item.get("encoding") != "base64":
-        raise BundleError("expected_small_base64_file")
+        raise BundleError("expected_base64_file")
     raw = base64.b64decode(item["content"])
-    if len(raw) > limit:
+    if limit is not None and len(raw) > limit:
         raise BundleError("file_too_large")
     if hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() != item.get("sha"):
         raise BundleError("blob_identity_mismatch")
     return raw
 
-def read_pinned_file(repo, path, ref, blob, limit):
-    """Use immutable Git blobs when Contents omits bodies above 1 MiB."""
+def read_repository_file(repo, path, ref, limit=None, expected_blob=None):
+    """Read a GitHub file by immutable identity, falling back to the Git blob body."""
     item = content(repo, path, ref)
-    if item.get("type") != "file" or item.get("sha") != blob:
+    if item.get("type") != "file":
+        raise BundleError("expected_file")
+    blob = item.get("sha", "")
+    if not BLOB_RE.fullmatch(blob):
+        raise BundleError("invalid_blob_identity")
+    if expected_blob is not None and blob != expected_blob:
         raise BundleError("pinned_file_identity_mismatch")
     size = item.get("size")
-    if type(size) is int and size > limit:
+    if limit is not None and type(size) is int and size > limit:
         raise BundleError("file_too_large")
-    if item.get("encoding") != "base64":
-        item = api(f"/repos/{safe_repo(repo)}/git/blobs/{blob}")
-        if item.get("sha") != blob:
-            raise BundleError("blob_identity_mismatch")
-        item = {**item, "type": "file"}
-    return decode_contents(item, limit)
+    if item.get("encoding") == "base64":
+        return decode_contents(item, limit), blob
+    blob_item = api(
+        f"/repos/{safe_repo(repo)}/git/blobs/{blob}",
+        max_response_bytes=None if limit is None else max(64 * 1024 * 1024, limit * 2),
+    )
+    if blob_item.get("sha") != blob:
+        raise BundleError("blob_identity_mismatch")
+    return decode_contents({**blob_item, "type": "file"}, limit), blob
+
+def read_pinned_file(repo, path, ref, blob, limit):
+    """Read a pinned private input; input limits remain a separate contract."""
+    raw, _ = read_repository_file(repo, path, ref, limit=limit, expected_blob=blob)
+    return raw
 
 def append_output(key, value):
     p = os.environ.get("GITHUB_OUTPUT")
@@ -171,24 +184,18 @@ def validate_bundle(raw, bundle_id):
             raise BundleError("invalid_base_source_ref")
         changed = b.get("changed_files", {})
         delete_files = b.get("delete_files", [])
-        if not isinstance(changed, dict) or len(changed) > MAX_SOURCE_FILES:
+        if not isinstance(changed, dict):
             raise BundleError("invalid_changed_files")
         if (not isinstance(delete_files, list)
-                or len(delete_files) > MAX_SOURCE_FILES
                 or len(set(delete_files)) != len(delete_files)):
             raise BundleError("invalid_delete_files")
         if not changed and not delete_files:
             raise BundleError("successor_no_requested_changes")
-        changed_total = 0
         for name, text in changed.items():
             if (not isinstance(name, str) or not FILE_RE.fullmatch(name)
                     or name == "BUNDLE_SOURCE.json" or not isinstance(text, str)):
                 raise BundleError("invalid_changed_source_entry")
-            data = text.encode("utf-8")
-            changed_total += len(data)
-            if len(data) > MAX_SOURCE_FILE or changed_total > MAX_SOURCE_TOTAL:
-                raise BundleError("source_too_large")
-            sources[name] = data
+            sources[name] = text.encode("utf-8")
         for name in delete_files:
             if (not isinstance(name, str) or not FILE_RE.fullmatch(name)
                     or name == "BUNDLE_SOURCE.json"):
@@ -200,7 +207,7 @@ def validate_bundle(raw, bundle_id):
     else:
         files = b.get("files")
         hashes = b.get("sha256")
-        if not isinstance(files, dict) or not 1 <= len(files) <= MAX_SOURCE_FILES:
+        if not isinstance(files, dict) or not files:
             raise BundleError("invalid_source_files")
         if "run_task.py" not in files:
             raise BundleError("invalid_source_manifest")
@@ -211,15 +218,11 @@ def validate_bundle(raw, bundle_id):
         if schema == SCHEMA or "sha256" in b:
             if not isinstance(hashes, dict) or set(hashes) != set(files):
                 raise BundleError("invalid_source_manifest")
-        total = 0
         for name, text in files.items():
             if (not FILE_RE.fullmatch(name) or name == "BUNDLE_SOURCE.json"
                     or not isinstance(text, str)):
                 raise BundleError("invalid_source_entry")
             data = text.encode("utf-8")
-            total += len(data)
-            if len(data) > MAX_SOURCE_FILE or total > MAX_SOURCE_TOTAL:
-                raise BundleError("source_too_large")
             if hashes is not None and hashlib.sha256(data).hexdigest() != hashes.get(name):
                 raise BundleError("source_hash_mismatch:" + name)
             sources[name] = data
@@ -246,16 +249,29 @@ def validate_bundle(raw, bundle_id):
     return b, sources, normalized_inputs, timeout_seconds
 
 
+def _commit_files(repo, commit_ref):
+    """Read all files changed by one commit without imposing a local file-count cap."""
+    files = []
+    page = 1
+    while True:
+        commit = api(
+            f"/repos/{safe_repo(repo)}/commits/{commit_ref}?per_page=100&page={page}"
+        )
+        if not isinstance(commit, dict) or commit.get("sha") != commit_ref:
+            raise BundleError("invalid_base_source_commit")
+        batch = commit.get("files")
+        if not isinstance(batch, list):
+            raise BundleError("base_source_commit_files_missing")
+        files.extend(batch)
+        if len(batch) < 100:
+            return files
+        page += 1
+
 def _load_base_source(repo, base_source_ref):
     """Resolve one prior materialized source commit from its immutable ref alone."""
     if not REF_RE.fullmatch(base_source_ref):
         raise BundleError("invalid_base_source_ref")
-    commit = api(f"/repos/{safe_repo(repo)}/commits/{base_source_ref}")
-    if not isinstance(commit, dict) or commit.get("sha") != base_source_ref:
-        raise BundleError("invalid_base_source_commit")
-    changed = commit.get("files")
-    if not isinstance(changed, list):
-        raise BundleError("base_source_commit_files_missing")
+    changed = _commit_files(repo, base_source_ref)
     manifest_re = re.compile(
         r"^transport/tasks/bundle-materialized/(bt-[A-Za-z0-9_.-]{1,64})/BUNDLE_SOURCE[.]json$"
     )
@@ -270,9 +286,8 @@ def _load_base_source(repo, base_source_ref):
     base_bundle_id, manifest_path = candidates[0]
     prefix = f"transport/tasks/bundle-materialized/{base_bundle_id}"
     try:
-        manifest = json.loads(decode_contents(
-            content(repo, manifest_path, base_source_ref), 1024 * 1024
-        ))
+        manifest_raw, _ = read_repository_file(repo, manifest_path, base_source_ref)
+        manifest = json.loads(manifest_raw)
     except Exception as exc:
         raise BundleError("invalid_base_source_manifest") from exc
     if (not isinstance(manifest, dict)
@@ -280,13 +295,12 @@ def _load_base_source(repo, base_source_ref):
             or manifest.get("bundle_id") != base_bundle_id):
         raise BundleError("invalid_base_source_manifest")
     declared = manifest.get("files")
-    if not isinstance(declared, dict) or not 1 <= len(declared) <= MAX_SOURCE_FILES:
+    if not isinstance(declared, dict) or not declared:
         raise BundleError("invalid_base_source_files")
     if "run_task.py" not in declared:
         raise BundleError("invalid_base_source_files")
     expected_commit_paths = {manifest_path}
     sources, blob_shas = {}, {}
-    total = 0
     for name, digest in sorted(declared.items()):
         if (not isinstance(name, str) or not FILE_RE.fullmatch(name)
                 or name == "BUNDLE_SOURCE.json"
@@ -295,15 +309,11 @@ def _load_base_source(repo, base_source_ref):
             raise BundleError("invalid_base_source_entry")
         path = f"{prefix}/{name}"
         expected_commit_paths.add(path)
-        item = content(repo, path, base_source_ref)
-        raw = decode_contents(item, MAX_SOURCE_FILE)
+        raw, blob = read_repository_file(repo, path, base_source_ref)
         if hashlib.sha256(raw).hexdigest() != digest:
             raise BundleError("base_source_hash_mismatch:" + name)
-        total += len(raw)
-        if total > MAX_SOURCE_TOTAL:
-            raise BundleError("base_source_too_large")
         sources[name] = raw
-        blob_shas[name] = item["sha"]
+        blob_shas[name] = blob
     actual_commit_paths = {
         item.get("filename") for item in changed if isinstance(item, dict)
     }
@@ -336,16 +346,10 @@ def _apply_successor_sources(base_sources, changed_sources, delete_files):
 
     if "run_task.py" not in final:
         raise BundleError("invalid_final_source_manifest")
-    if not 1 <= len(final) <= MAX_SOURCE_FILES:
-        raise BundleError("invalid_final_source_manifest")
-    total = 0
     for name, raw in final.items():
         if (not FILE_RE.fullmatch(name) or name == "BUNDLE_SOURCE.json"
                 or not isinstance(raw, (bytes, bytearray))):
             raise BundleError("invalid_final_source_entry")
-        total += len(raw)
-        if len(raw) > MAX_SOURCE_FILE or total > MAX_SOURCE_TOTAL:
-            raise BundleError("source_too_large")
     if not actual_changed and not deleted:
         raise BundleError("successor_no_effect")
     inherited = sorted(name for name in final if name not in actual_changed)
@@ -457,8 +461,7 @@ def materialize(repo, bundle_id):
     if not BUNDLE_RE.fullmatch(bundle_id):
         raise BundleError("invalid_bundle_id")
     bundle_path = f"transport/bundle_inbox/{bundle_id}.json"
-    item = content(repo, bundle_path, "main")
-    raw = decode_contents(item, 1024 * 1024)
+    raw, bundle_blob = read_repository_file(repo, bundle_path, "main")
     bundle, submitted_sources, inputs, timeout_seconds = validate_bundle(raw, bundle_id)
 
     complete_path = f"transport/bundle-executions/{bundle_id}/completed.json"
@@ -468,13 +471,13 @@ def materialize(repo, bundle_id):
         if exc.code != 404:
             raise
     else:
-        if (complete.get("bundle_blob") != item["sha"]
+        if (complete.get("bundle_blob") != bundle_blob
                 or complete.get("status") != "materialized"
                 or not REF_RE.fullmatch(complete.get("source_ref", ""))):
             raise BundleError("completed_bundle_identity_changed")
         append_output("skip", "true")
         append_output("source_ref", complete["source_ref"])
-        append_output("bundle_blob", item["sha"])
+        append_output("bundle_blob", bundle_blob)
         append_output("timeout_seconds", str(timeout_seconds))
         print("MATERIALIZE_STAGE=already-completed")
         return
@@ -496,7 +499,7 @@ def materialize(repo, bundle_id):
         "schema": SUCCESSOR_SOURCE_SCHEMA if successor is not None else SOURCE_SCHEMA,
         "bundle_id": bundle_id,
         "bundle_path": bundle_path,
-        "bundle_blob": item["sha"],
+        "bundle_blob": bundle_blob,
         "files": {k: hashlib.sha256(v).hexdigest() for k, v in sorted(sources.items())},
         "inputs": inputs,
         "timeout_seconds": timeout_seconds,
@@ -532,12 +535,12 @@ def materialize(repo, bundle_id):
         )
 
     for name, data in sources.items():
-        got = decode_contents(content(repo, f"{prefix}/{name}", source_ref), MAX_SOURCE_FILE)
+        got, _ = read_repository_file(repo, f"{prefix}/{name}", source_ref)
         if got != data:
             raise BundleError("immutable_source_readback_mismatch:" + name)
 
     append_output("source_ref", source_ref)
-    append_output("bundle_blob", item["sha"])
+    append_output("bundle_blob", bundle_blob)
     append_output("timeout_seconds", str(timeout_seconds))
     append_output("skip", "false")
     print("MATERIALIZE_STAGE=complete")
@@ -547,8 +550,8 @@ def fetch_task(repo, bundle_id, source_ref, dest):
     if not REF_RE.fullmatch(source_ref):
         raise BundleError("invalid_source_ref")
     prefix = f"transport/tasks/bundle-materialized/{bundle_id}"
-    manifest_raw = decode_contents(
-        content(repo, f"{prefix}/BUNDLE_SOURCE.json", source_ref), 1024 * 1024
+    manifest_raw, _ = read_repository_file(
+        repo, f"{prefix}/BUNDLE_SOURCE.json", source_ref
     )
     manifest = json.loads(manifest_raw)
     if (manifest.get("schema") not in (SOURCE_SCHEMA, SUCCESSOR_SOURCE_SCHEMA)
@@ -559,7 +562,7 @@ def fetch_task(repo, bundle_id, source_ref, dest):
 
     total_inputs = 0
     for name, digest in manifest["files"].items():
-        raw = decode_contents(content(repo, f"{prefix}/{name}", source_ref), MAX_SOURCE_FILE)
+        raw, _ = read_repository_file(repo, f"{prefix}/{name}", source_ref)
         if hashlib.sha256(raw).hexdigest() != digest:
             raise BundleError("source_fetch_hash_mismatch:" + name)
         p = target / name
