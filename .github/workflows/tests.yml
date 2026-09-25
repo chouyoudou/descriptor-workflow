@@ -2,6 +2,7 @@ name: Tests
 on:
   push:
     paths:
+      - "bundle_control.py"
       - "crystal_geometry.py"
       - "restricted_exec.py"
       - "tests/**"
@@ -9,6 +10,7 @@ on:
       - ".github/workflows/tests.yml"
   pull_request:
     paths:
+      - "bundle_control.py"
       - "crystal_geometry.py"
       - "restricted_exec.py"
       - "tests/**"
