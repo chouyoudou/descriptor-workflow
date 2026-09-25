@@ -11,7 +11,8 @@ import bundle_control as bc
 
 
 def git_blob(raw):
-    return hashlib.sha1(f"blob {len(raw)}\\0".encode() + raw).hexdigest()
+    header = ("blob %d" % len(raw)).encode() + bytes([0])
+    return hashlib.sha1(header + raw).hexdigest()
 
 
 def item(raw):
