@@ -601,10 +601,10 @@ def validate_jsonl(path, expected_rows):
     return count
 
 def publish(repo, bundle_id, source_ref, bundle_blob, output):
-    from private_io import inspect_result_jsonl
+    from private_io import inspect_result_jsonl, inspect_progress_jsonl
     out = Path(output)
     allowed = {
-        "result.jsonl", "summary.json", "focused-and-batch.log",
+        "result.jsonl", "summary.json", "focused-and-batch.log", "progress.jsonl",
         "execution.stdout.log", "execution.stderr.log", "execution.json",
     }
     collected = {}
@@ -635,6 +635,7 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
         errors.append("missing_focused_log")
     expected_rows = summary.get("rows")
     result_validation = inspect_result_jsonl(out / "result.jsonl", expected_rows)
+    progress_validation = inspect_progress_jsonl(out / "progress.jsonl", execution)
     success = (
         summary.get("stage") == "materialized"
         and execution.get("exit_code") == 0
@@ -660,6 +661,7 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
         "result_rows": actual_rows,
         "status": "materialized" if success else "failed_or_partial",
         "result_validation": result_validation,
+        "progress": progress_validation,
         "metadata_errors": errors,
     }
     files = {f"{prefix}/{name}": raw for name, raw in collected.items()}
@@ -678,6 +680,7 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
         "receipt_path": f"{prefix}/receipt.json",
         "result_path": f"{prefix}/result.jsonl" if "result.jsonl" in collected else None,
         "summary_path": f"{prefix}/summary.json" if "summary.json" in collected else None,
+        "progress_path": f"{prefix}/progress.jsonl" if "progress.jsonl" in collected else None,
     }
     files[f"transport/reviews/pending/{bundle_id}/{run}-{attempt}.json"] = (
         json.dumps(review_submission, indent=2, sort_keys=True) + "\n"
