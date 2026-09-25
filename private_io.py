@@ -9,6 +9,7 @@ from pathlib import Path
 import random
 import re
 import stat
+import statistics
 import subprocess
 import sys
 import time
@@ -216,6 +217,137 @@ def inspect_result_jsonl(path, expected_rows=None):
                 "records": records, "expected_rows": expected_rows}
     return {"status": "valid", "records": records}
 
+def _finite_nonnegative_number(value):
+    return (type(value) in (int, float)
+            and value >= 0
+            and value != float("inf")
+            and value != float("-inf")
+            and value == value)
+
+def inspect_progress_jsonl(path, execution=None):
+    """Summarize optional candidate progress while tolerating a truncated final line."""
+    path = Path(path)
+    execution = execution if isinstance(execution, dict) else {}
+    if not path.exists():
+        result = {"status": "missing", "records": 0}
+        if execution.get("timed_out"):
+            result["timeout_pattern"] = "timeout_no_progress_records"
+        return result
+    try:
+        st = path.lstat()
+    except OSError:
+        return {"status": "invalid", "reason": "stat_failed", "records": 0}
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        return {"status": "invalid", "reason": "not_regular_file", "records": 0}
+    if st.st_size <= 0:
+        return {"status": "invalid", "reason": "empty", "records": 0}
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return {"status": "invalid", "reason": "read_failed", "records": 0}
+    lines = text.splitlines(keepends=True)
+    valid = []
+    item_timings = []
+    truncated_final = False
+    previous_processed = -1
+    previous_elapsed = -1.0
+    for index, line in enumerate(lines):
+        line_number = index + 1
+        if not line.strip():
+            return {"status": "invalid", "reason": "blank_line",
+                    "records": len(valid), "line": line_number}
+        try:
+            row = json.loads(line, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            if index == len(lines) - 1 and not line.endswith("\n"):
+                truncated_final = True
+                break
+            return {"status": "invalid", "reason": "invalid_json",
+                    "records": len(valid), "line": line_number}
+        if not isinstance(row, dict) or row.get("schema") != "descriptor-progress/1":
+            return {"status": "invalid", "reason": "invalid_progress_record",
+                    "records": len(valid), "line": line_number}
+        processed = row.get("processed")
+        total = row.get("total")
+        elapsed = row.get("elapsed_seconds")
+        last_id = row.get("last_id")
+        item_seconds = row.get("item_seconds")
+        phase = row.get("phase")
+        if type(processed) is not int or processed < 0:
+            return {"status": "invalid", "reason": "invalid_processed",
+                    "records": len(valid), "line": line_number}
+        if total is not None and (type(total) is not int or total < processed or total < 0):
+            return {"status": "invalid", "reason": "invalid_total",
+                    "records": len(valid), "line": line_number}
+        if not _finite_nonnegative_number(elapsed):
+            return {"status": "invalid", "reason": "invalid_elapsed",
+                    "records": len(valid), "line": line_number}
+        if last_id is not None and not isinstance(last_id, str):
+            return {"status": "invalid", "reason": "invalid_last_id",
+                    "records": len(valid), "line": line_number}
+        if item_seconds is not None and not _finite_nonnegative_number(item_seconds):
+            return {"status": "invalid", "reason": "invalid_item_seconds",
+                    "records": len(valid), "line": line_number}
+        if phase is not None and not isinstance(phase, str):
+            return {"status": "invalid", "reason": "invalid_phase",
+                    "records": len(valid), "line": line_number}
+        if processed < previous_processed or elapsed < previous_elapsed:
+            return {"status": "invalid", "reason": "nonmonotonic_progress",
+                    "records": len(valid), "line": line_number}
+        previous_processed = processed
+        previous_elapsed = float(elapsed)
+        normalized = {
+            "processed": processed,
+            "total": total,
+            "elapsed_seconds": float(elapsed),
+            "last_id": last_id,
+            "item_seconds": None if item_seconds is None else float(item_seconds),
+            "phase": phase,
+        }
+        valid.append(normalized)
+        if item_seconds is not None:
+            item_timings.append((float(item_seconds), last_id))
+
+    if not valid:
+        return {"status": "partial" if truncated_final else "invalid",
+                "reason": "truncated_final_line" if truncated_final else "no_valid_records",
+                "records": 0}
+    last = valid[-1]
+    result = {
+        "status": "partial" if truncated_final else "valid",
+        "records": len(valid),
+        "processed": last["processed"],
+        "total": last["total"],
+        "reported_elapsed_seconds": last["elapsed_seconds"],
+        "last_id": last["last_id"],
+        "last_item_seconds": last["item_seconds"],
+        "phase": last["phase"],
+        "truncated_final_line": truncated_final,
+    }
+    if item_timings:
+        seconds = [x[0] for x in item_timings]
+        slowest_seconds, slowest_id = max(item_timings, key=lambda x: x[0])
+        result["timed_items"] = len(seconds)
+        result["median_item_seconds"] = float(statistics.median(seconds))
+        result["slowest_item_seconds"] = slowest_seconds
+        result["slowest_id"] = slowest_id
+    wall = execution.get("wall_seconds")
+    if _finite_nonnegative_number(wall):
+        gap = max(0.0, float(wall) - last["elapsed_seconds"])
+        result["seconds_since_last_progress"] = gap
+        if execution.get("timed_out"):
+            median = result.get("median_item_seconds")
+            threshold = max(60.0, 5.0 * median) if median is not None else 120.0
+            result["timeout_pattern"] = (
+                "timeout_long_gap_since_progress"
+                if gap >= threshold
+                else "timeout_recent_progress"
+            )
+    elif execution.get("timed_out"):
+        result["timeout_pattern"] = "timeout_progress_present_wall_unknown"
+    return result
+
 def prepare(repo, task_path, request_path, state_path):
     repo = safe_repo(repo)
     if api(f"/repos/{repo}").get("private") is not True:
@@ -293,6 +425,8 @@ def execute(task_dir, output_dir, image, timeout):
            "-e", "MPLCONFIGDIR=/tmp/matplotlib", "-e", "XDG_CACHE_HOME=/tmp/cache",
            "-e", "OPENBLAS_NUM_THREADS=1", "-e", "OMP_NUM_THREADS=1",
            "-e", "DESCRIPTOR_WORKERS=4",
+           "-e", "DESCRIPTOR_PROGRESS_PATH=/output/progress.jsonl",
+           "-e", f"DESCRIPTOR_TIMEOUT_SECONDS={timeout}",
            "--mount", f"type=bind,src={Path(task_dir).resolve()},dst=/task,readonly",
            "--mount", f"type=bind,src={out.resolve()},dst=/output",
            "--workdir", "/task", image, "python3", "-B", "/task/run_task.py", "--output", "/output"]
@@ -300,24 +434,35 @@ def execute(task_dir, output_dir, image, timeout):
     failure = None
     creation_stderr = b''
     cleanup_failed = False
+    candidate_started = False
+    candidate_started_at = None
+    candidate_wall_seconds = None
     try:
         created = subprocess.run(cmd, capture_output=True, check=False, timeout=30)
         if created.returncode:
             creation_stderr = created.stderr[:1048576]
             raise PrivateIOError("container_create_failed")
         print("EXECUTION_STAGE=candidate-start", flush=True)
+        candidate_started = True
+        candidate_started_at = time.monotonic()
         result = run_bounded(["docker", "start", "-a", name],
                              timeout_seconds=timeout, max_output_bytes=1048576)
+        candidate_wall_seconds = time.monotonic() - candidate_started_at
         print("EXECUTION_STAGE=candidate-returned", flush=True)
     except Exception as exc:
         failure = exc
+        if candidate_started_at is not None and candidate_wall_seconds is None:
+            candidate_wall_seconds = time.monotonic() - candidate_started_at
     finally:
         # Preserve exit facts before asking the daemon to clean up. A hung
         # control call must not block private publication of durable prefixes.
         status = {"exit_code": result.child_exit_code if result else 125,
                   "timed_out": result.timed_out if result else isinstance(failure, subprocess.TimeoutExpired),
                   "output_limit_exceeded": result.output_limit_exceeded if result else False,
-                  "host_failure_class": type(failure).__name__ if failure else None}
+                  "host_failure_class": type(failure).__name__ if failure else None,
+                  "candidate_started": candidate_started,
+                  "wall_seconds": candidate_wall_seconds,
+                  "timeout_budget_seconds": timeout}
         (out / "execution.stdout.log").write_bytes(result.stdout if result else b'')
         (out / "execution.stderr.log").write_bytes(result.stderr if result else creation_stderr)
         write_json(out / "execution.json", status)
@@ -345,7 +490,7 @@ def execute(task_dir, output_dir, image, timeout):
 def publish(state_path, output_dir):
     state = json.loads(Path(state_path).read_text())
     out = Path(output_dir)
-    allowed = {"result.jsonl", "summary.json", "focused-and-batch.log",
+    allowed = {"result.jsonl", "summary.json", "focused-and-batch.log", "progress.jsonl",
                "execution.stdout.log", "execution.stderr.log", "execution.json"}
     files, descriptions = {}, {}
     if out.exists():
@@ -367,11 +512,13 @@ def publish(state_path, output_dir):
         out / "result.jsonl",
         None if not isinstance(summary, dict) else summary.get("rows"),
     )
+    progress_validation = inspect_progress_jsonl(out / "progress.jsonl", execution)
     receipt = {"schema": "private-computation-receipt/1", "state": state,
                "files": descriptions,
                "materialized_file_present": "result.jsonl" in descriptions,
                "result_validation": result_validation,
-               "note": "Inspect summary and execution status; receipt alone does not establish scientific success."}
+               "progress": progress_validation,
+               "note": "Inspect execution/result/progress; 30 minutes is an interactive diagnostic budget, not evidence that heavier compute is impossible."}
     files[state["destination"] + "/receipt.json"] = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
 
     success_claim = (
