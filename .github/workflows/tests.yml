@@ -2,20 +2,22 @@ name: Tests
 on:
   push:
     paths:
-      - "bundle_control.py"
+      - "bundle_*.py"
       - "crystal_geometry.py"
       - "restricted_exec.py"
       - "tests/**"
       - "examples/**"
       - ".github/workflows/tests.yml"
+      - ".github/workflows/private-bundle-integration.yml"
   pull_request:
     paths:
-      - "bundle_control.py"
+      - "bundle_*.py"
       - "crystal_geometry.py"
       - "restricted_exec.py"
       - "tests/**"
       - "examples/**"
       - ".github/workflows/tests.yml"
+      - ".github/workflows/private-bundle-integration.yml"
   workflow_dispatch:
 permissions:
   contents: read
