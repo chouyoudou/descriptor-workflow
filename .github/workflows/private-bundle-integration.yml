@@ -153,10 +153,11 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf "$RUNNER_TEMP/bundle-task"
-          python3 bundle_control.py fetch-task \
+          python3 bundle_ingress.py fetch-task \
             --repo "$PRIVATE_REPOSITORY" \
             --bundle-id "${{ needs.resolve.outputs.bundle_id }}" \
             --source-ref "${{ steps.materialize.outputs.source_ref }}" \
+            --bundle-blob "${{ steps.materialize.outputs.bundle_blob }}" \
             --dest "$RUNNER_TEMP/bundle-task"
 
       - name: Execute in existing isolated candidate boundary
