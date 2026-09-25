@@ -518,11 +518,18 @@ def materialize(repo, bundle_id):
     formal[f"{prefix}/BUNDLE_SOURCE.json"] = (
         json.dumps(source_manifest, indent=2, sort_keys=True) + "\n"
     ).encode()
-    source_ref = put_create_only(
-        repo, formal, "Materialize validated private task bundle",
-        recovery_ref=recovery_branch(bundle_id, "source"),
-        known_blob_shas=known_blob_shas,
-    )
+    if successor is not None:
+        source_ref = put_create_only(
+            repo, formal, "Materialize validated private task bundle",
+            recovery_ref=recovery_branch(bundle_id, "source"),
+            known_blob_shas=known_blob_shas,
+        )
+    else:
+        # Preserve the V2/V3 publisher call shape exactly for compatibility.
+        source_ref = put_create_only(
+            repo, formal, "Materialize validated private task bundle",
+            recovery_ref=recovery_branch(bundle_id, "source"),
+        )
 
     for name, data in sources.items():
         got = decode_contents(content(repo, f"{prefix}/{name}", source_ref), MAX_SOURCE_FILE)
