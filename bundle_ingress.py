@@ -1,8 +1,7 @@
-"""Small trusted admission layer for immutable bundle execution.
+"""Small trusted admission layer for immutable source and run requests.
 
-Issues carry an opaque identifier only. Admission runs before dependency setup;
-source generation, validation and publication remain in bundle_control.py.
-No candidate is executed here and no external submit service is required.
+Issues carry an opaque identifier only. An existing source can be run with new
+inputs/config without source publication. No candidate runs during admission.
 """
 from __future__ import annotations
 
@@ -13,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import urllib.error
 import urllib.parse
@@ -20,6 +20,8 @@ import urllib.parse
 ID_RE = re.compile(r"bt-[A-Za-z0-9_.-]{1,64}\Z")
 REF_RE = re.compile(r"[0-9a-f]{40}\Z")
 STATES = {"source_ready", "already_completed", "rejected"}
+RUN_SCHEMA = "private-run-request/1"
+CONFIG_NAME = "run_config.json"
 
 
 def trigger_decision(event, actor, owner, triggering_actor=None):
@@ -72,12 +74,82 @@ def resolve(event_path):
     return result
 
 
-def materialize_outputs(control, repo, bundle_id):
-    """Use the existing materializer's output contract without echoing details.
+def validate_run_request(control, request, bundle_id):
+    """Validate a run, not a source edit. Config is plain JSON, never evaluated."""
+    if (not isinstance(request, dict) or request.get("schema") != RUN_SCHEMA
+            or request.get("bundle_id") != bundle_id):
+        raise ValueError("run_request_identity_mismatch")
+    ref = request.get("source_ref")
+    if not isinstance(ref, str) or not REF_RE.fullmatch(ref):
+        raise ValueError("invalid_run_source_ref")
+    if {"files", "changed_files", "delete_files", "sha256", "base_source_ref"} & request.keys():
+        raise ValueError("run_request_cannot_edit_source")
+    inputs = request.get("inputs", {})
+    if not isinstance(inputs, dict) or len(inputs) > control.MAX_INPUT_FILES:
+        raise ValueError("invalid_inputs")
+    normalized = {}
+    for name, spec in inputs.items():
+        if (not isinstance(name, str) or not control.FILE_RE.fullmatch(name)
+                or name == "BUNDLE_SOURCE.json" or not isinstance(spec, dict)):
+            raise ValueError("invalid_input_entry")
+        path = control.safe_path(spec.get("path"))
+        if not any(path.startswith(p) for p in control.ALLOWED_INPUT_PREFIXES):
+            raise ValueError("input_path_not_allowed")
+        if any(not isinstance(spec.get(k), str) or not REF_RE.fullmatch(spec[k])
+               for k in ("ref", "blob")):
+            raise ValueError("input_identity_invalid")
+        normalized[name] = {"path": path, "ref": spec["ref"], "blob": spec["blob"]}
+    budget = request.get("timeout_seconds", 1800)
+    if type(budget) is not int or not 30 <= budget <= 1800:
+        raise ValueError("invalid_timeout")
+    config = None
+    if "config" in request:
+        if not isinstance(request["config"], dict):
+            raise ValueError("invalid_run_config")
+        config = (json.dumps(request["config"], ensure_ascii=False, sort_keys=True,
+                             allow_nan=False) + "\n").encode("utf-8")
+        if CONFIG_NAME in normalized:
+            raise ValueError("run_config_input_collision")
+    return ref, normalized, budget, config
 
-    A temporary GITHUB_OUTPUT belongs to this trusted step only. The final job
-    outputs are released only after the private admission receipt is durable.
-    """
+
+def check_run_names(base, inputs, config):
+    if set(inputs) & set(base["sources"]):
+        raise ValueError("input_source_name_collision")
+    if config is not None and CONFIG_NAME in base["sources"]:
+        raise ValueError("run_config_source_collision")
+
+
+def run_outputs(control, repo, bundle_id, request, blob):
+    """An immutable request reuses source_ref; it never writes source files."""
+    ref, inputs, budget, config = validate_run_request(control, request, bundle_id)
+    outputs = {"source_ref": ref, "bundle_blob": blob, "timeout_seconds": str(budget),
+               "source_mode": "reused", "skip": "false"}
+    path = f"transport/bundle-executions/{bundle_id}/completed.json"
+    try:
+        raw, _ = control.read_repository_file(repo, path, "main")
+        completed = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+    else:
+        if (not isinstance(completed, dict) or completed.get("bundle_blob") != blob
+                or completed.get("source_ref") != ref
+                or completed.get("status") != "materialized"):
+            raise ValueError("completed_run_identity_changed")
+        return {**outputs, "skip": "true"}
+    base = control._load_base_source(repo, ref)
+    check_run_names(base, inputs, config)
+    return outputs
+
+
+def materialize_outputs(control, repo, bundle_id):
+    """Route source submissions and source-reusing runs through one admission."""
+    raw, blob = control.read_repository_file(
+        repo, f"transport/bundle_inbox/{bundle_id}.json", "main")
+    request = json.loads(raw)
+    if isinstance(request, dict) and request.get("schema") == RUN_SCHEMA:
+        return run_outputs(control, repo, bundle_id, request, blob)
     previous = os.environ.get("GITHUB_OUTPUT")
     captured = io.StringIO()
     try:
@@ -109,12 +181,7 @@ def materialize_outputs(control, repo, bundle_id):
 
 
 def original_source_ref(control, repo, bundle_id, outputs):
-    """Resolve the original source commit after an ambiguous publication retry.
-
-    put_create_only may return today's main if identical files already exist.
-    That is a valid read ref but not necessarily the original source commit.
-    Follow the immutable manifest's last change and revalidate if it differs.
-    """
+    """Resolve the original source commit after an ambiguous publication retry."""
     ref = outputs["source_ref"]
     manifest_path = f"transport/tasks/bundle-materialized/{bundle_id}/BUNDLE_SOURCE.json"
     raw, _ = control.read_repository_file(repo, manifest_path, ref)
@@ -134,6 +201,59 @@ def original_source_ref(control, repo, bundle_id, outputs):
         if verified["bundle_id"] != bundle_id or verified["manifest"] != manifest:
             raise ValueError("source_origin_identity_mismatch")
     return origin
+
+
+def fetch_task(repo, bundle_id, source_ref, bundle_blob, dest, control=None):
+    """Fetch the admitted immutable request, never a later mutable inbox body."""
+    if control is None:
+        import bundle_control as control
+    repo = control.safe_repo(repo)
+    if (not ID_RE.fullmatch(bundle_id) or not REF_RE.fullmatch(source_ref)
+            or not REF_RE.fullmatch(bundle_blob)):
+        raise ValueError("invalid_fetch_identity")
+    item = control.api(f"/repos/{repo}/git/blobs/{bundle_blob}", max_response_bytes=None)
+    if item.get("sha") != bundle_blob:
+        raise ValueError("request_blob_identity_mismatch")
+    raw = control.decode_contents({**item, "type": "file"})
+    request = json.loads(raw)
+    if not isinstance(request, dict) or request.get("bundle_id") != bundle_id:
+        raise ValueError("run_request_identity_mismatch")
+    if request.get("schema") != RUN_SCHEMA:
+        manifest, _ = control.read_repository_file(
+            repo, f"transport/tasks/bundle-materialized/{bundle_id}/BUNDLE_SOURCE.json", source_ref)
+        if json.loads(manifest).get("bundle_blob") != bundle_blob:
+            raise ValueError("source_request_identity_mismatch")
+        return control.fetch_task(repo, bundle_id, source_ref, dest)
+    ref, inputs, _, config = validate_run_request(control, request, bundle_id)
+    if ref != source_ref:
+        raise ValueError("run_source_identity_mismatch")
+    base = control._load_base_source(repo, ref)
+    check_run_names(base, inputs, config)
+    target = Path(dest)
+    target.mkdir(mode=0o700, parents=True, exist_ok=False)
+    try:
+        def write(name, data):
+            path = target / name
+            with path.open("xb") as stream:
+                stream.write(data)
+            path.chmod(0o400)
+        for name, data in base["sources"].items():
+            write(name, data)
+        total = 0
+        for name, spec in inputs.items():
+            data = control.read_pinned_file(
+                repo, spec["path"], spec["ref"], spec["blob"], control.MAX_INPUT_FILE)
+            total += len(data)
+            if total > control.MAX_INPUT_TOTAL:
+                raise ValueError("input_total_too_large")
+            write(name, data)
+        if config is not None:
+            write(CONFIG_NAME, config)
+    except Exception:
+        # Only remove this invocation's newly created staging directory.
+        shutil.rmtree(target)
+        raise
+    print("FETCH_TASK_STAGE=complete")
 
 
 def error_category(exc):
@@ -172,17 +292,16 @@ def admit(repo, bundle_id, control=None):
     failure = None
     try:
         outputs = materialize_outputs(control, repo, bundle_id)
-        # Completed receipts already contain their exact production source ref.
-        if outputs["skip"] != "true":
+        if outputs["skip"] != "true" and outputs.get("source_mode") != "reused":
             outputs["source_ref"] = original_source_ref(control, repo, bundle_id, outputs)
         record.update(
             state="already_completed" if outputs["skip"] == "true" else "source_ready",
             source_ref=outputs["source_ref"], bundle_blob=outputs["bundle_blob"],
             timeout_seconds=int(outputs["timeout_seconds"]),
+            source_mode=outputs.get("source_mode", "materialized"),
         )
     except Exception as exc:
         failure = exc
-        # Detailed reason stays private. Public logs contain only fixed enums.
         record.update(error_category=error_category(exc),
                       error_class=type(exc).__name__, detail=str(exc))
     raw = (json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
@@ -212,14 +331,18 @@ def main():
     admission = sub.add_parser("admit")
     admission.add_argument("--repo", required=True)
     admission.add_argument("--bundle-id", required=True)
+    fetcher = sub.add_parser("fetch-task")
+    for name in ("repo", "bundle-id", "source-ref", "bundle-blob", "dest"):
+        fetcher.add_argument("--" + name, required=True)
     args = parser.parse_args()
     try:
         if args.command == "resolve":
             resolve(args.event)
-        else:
+        elif args.command == "admit":
             admit(args.repo, args.bundle_id)
+        else:
+            fetch_task(args.repo, args.bundle_id, args.source_ref, args.bundle_blob, args.dest)
     except Exception:
-        # No traceback, API response body, source name, token or private path.
         print("INGRESS_STAGE=failed")
         return 1
     return 0
