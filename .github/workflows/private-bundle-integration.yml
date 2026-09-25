@@ -2,7 +2,7 @@ name: Private bundle integration
 
 on:
   issues:
-    types: [opened]
+    types: [opened, reopened]
 
 permissions:
   contents: read
@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
       - name: Resolve opaque owner-only bundle trigger
         id: resolve
-        run: python3 bundle_control.py resolve --event "$GITHUB_EVENT_PATH"
+        run: python3 bundle_ingress.py resolve --event "$GITHUB_EVENT_PATH"
 
   integrate:
     needs: resolve
@@ -40,8 +40,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Admit bundle before runtime setup
+        id: materialize
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 bundle_ingress.py admit \
+            --repo "$PRIVATE_REPOSITORY" \
+            --bundle-id "${{ needs.resolve.outputs.bundle_id }}"
+
       - name: Derive content-addressed public runtime identity
         id: profile
+        if: steps.materialize.outputs.skip != 'true'
         run: |
           set -euo pipefail
           python3 public_env/runtime_cache.py identity \
@@ -53,6 +64,7 @@ jobs:
 
       - name: Restore verified public runtime image
         id: runtime_cache
+        if: steps.materialize.outputs.skip != 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-runtime-cache
@@ -60,6 +72,7 @@ jobs:
 
       - name: Load and verify cached public runtime
         id: runtime
+        if: steps.materialize.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -83,7 +96,7 @@ jobs:
 
       - name: Restore content-addressed public wheelhouse
         id: wheels_v2
-        if: steps.runtime.outputs.ready != 'true'
+        if: steps.materialize.outputs.skip != 'true' && steps.runtime.outputs.ready != 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-wheelhouse
@@ -91,14 +104,14 @@ jobs:
 
       - name: Restore exact legacy wheelhouse for one-way migration
         id: wheels_v1
-        if: steps.runtime.outputs.ready != 'true' && steps.wheels_v2.outputs.cache-hit != 'true'
+        if: steps.materialize.outputs.skip != 'true' && steps.runtime.outputs.ready != 'true' && steps.wheels_v2.outputs.cache-hit != 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .public-wheelhouse
           key: public-wheelhouse-v1-Linux-X64-cp312-${{ env.PUBLIC_LOCK_SHA }}
 
       - name: Build and verify public runtime on cache miss
-        if: steps.runtime.outputs.ready != 'true'
+        if: steps.materialize.outputs.skip != 'true' && steps.runtime.outputs.ready != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -132,16 +145,6 @@ jobs:
             --base-image "$PYTHON_IMAGE" \
             --public-deps public_env/public_deps.py \
             --json-output "$RUNNER_TEMP/runtime-build-verification.json" >/dev/null
-
-      - name: Materialize validated bundle as immutable private source
-        id: materialize
-        env:
-          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-        run: |
-          set -euo pipefail
-          python3 bundle_control.py materialize \
-            --repo "$PRIVATE_REPOSITORY" \
-            --bundle-id "${{ needs.resolve.outputs.bundle_id }}"
 
       - name: Fetch immutable source and pinned private inputs
         if: steps.materialize.outputs.skip != 'true'
