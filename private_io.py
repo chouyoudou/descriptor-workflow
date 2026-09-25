@@ -338,7 +338,17 @@ def inspect_progress_jsonl(path, execution=None):
         result["seconds_since_last_progress"] = gap
         if execution.get("timed_out"):
             median = result.get("median_item_seconds")
-            threshold = max(60.0, 5.0 * median) if median is not None else 120.0
+            budget = execution.get("timeout_budget_seconds")
+            if median is not None:
+                floor = 60.0
+                if _finite_nonnegative_number(budget) and budget > 0:
+                    floor = min(floor, max(1.0, 0.10 * float(budget)))
+                threshold = max(floor, 5.0 * median)
+            else:
+                threshold = 120.0
+                if _finite_nonnegative_number(budget) and budget > 0:
+                    threshold = min(threshold, max(2.0, 0.25 * float(budget)))
+            result["long_gap_threshold_seconds"] = threshold
             result["timeout_pattern"] = (
                 "timeout_long_gap_since_progress"
                 if gap >= threshold
