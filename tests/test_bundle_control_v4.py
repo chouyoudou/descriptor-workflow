@@ -53,6 +53,7 @@ class BundleV4ValidationTests(unittest.TestCase):
             "timeout_seconds": 30,
         }
         cases = [
+            ({**base, "base_source_ref": "not-a-commit", "changed_files": {"x.py": "x"}, "delete_files": []}, "invalid_base_source_ref"),
             ({**base, "changed_files": {}, "delete_files": []}, "successor_no_requested_changes"),
             ({**base, "changed_files": {"same.py": "x"}, "delete_files": ["same.py"]}, "successor_change_delete_overlap"),
             ({**base, "changed_files": {}, "delete_files": ["run_task.py"]}, "cannot_delete_run_task"),
