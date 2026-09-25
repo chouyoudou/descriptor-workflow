@@ -26,8 +26,10 @@ REF_RE = re.compile(r"^[0-9a-f]{40}$")
 BLOB_RE = re.compile(r"^[0-9a-f]{40}$")
 SCHEMA = "private-task-bundle/2"
 TEXT_SCHEMA = "private-task-bundle/3"
+SUCCESSOR_SCHEMA = "private-task-bundle/4"
 TRIGGER_SCHEMA = "private-bundle-trigger/2"
 SOURCE_SCHEMA = "bundle-materialized-source/2"
+SUCCESSOR_SOURCE_SCHEMA = "bundle-materialized-source/3"
 ALLOWED_INPUT_PREFIXES = (
     "inputs/",
     "elements/",
@@ -154,36 +156,73 @@ def validate_bundle(raw, bundle_id):
         b = json.loads(raw)
     except Exception as exc:
         raise BundleError("invalid_bundle_json") from exc
-    if (not isinstance(b, dict) or b.get("schema") not in (SCHEMA, TEXT_SCHEMA)
+    schema = b.get("schema") if isinstance(b, dict) else None
+    if (not isinstance(b, dict)
+            or schema not in (SCHEMA, TEXT_SCHEMA, SUCCESSOR_SCHEMA)
             or b.get("bundle_id") != bundle_id):
         raise BundleError("bundle_identity_mismatch")
 
-    files = b.get("files")
-    hashes = b.get("sha256")
-    if not isinstance(files, dict) or not 1 <= len(files) <= MAX_SOURCE_FILES:
-        raise BundleError("invalid_source_files")
-    if "run_task.py" not in files:
-        raise BundleError("invalid_source_manifest")
-    # V2 retains its exact declared-hash contract. V3 can omit the redundant
-    # client-computed manifest: the immutable Git bundle binds the received
-    # text, and materialize/fetch_task derive and verify its exact UTF-8 bytes.
-    # If a V3 client DOES declare hashes, contradictions still fail closed.
-    if b["schema"] == SCHEMA or "sha256" in b:
-        if not isinstance(hashes, dict) or set(hashes) != set(files):
-            raise BundleError("invalid_source_manifest")
-    total = 0
     sources = {}
-    for name, text in files.items():
-        if (not FILE_RE.fullmatch(name) or name == "BUNDLE_SOURCE.json"
-                or not isinstance(text, str)):
-            raise BundleError("invalid_source_entry")
-        data = text.encode("utf-8")
-        total += len(data)
-        if len(data) > MAX_SOURCE_FILE or total > MAX_SOURCE_TOTAL:
-            raise BundleError("source_too_large")
-        if hashes is not None and hashlib.sha256(data).hexdigest() != hashes.get(name):
-            raise BundleError("source_hash_mismatch:" + name)
-        sources[name] = data
+    if schema == SUCCESSOR_SCHEMA:
+        if "files" in b or "sha256" in b:
+            raise BundleError("successor_ambiguous_source_fields")
+        base_source_ref = b.get("base_source_ref", "")
+        if not REF_RE.fullmatch(base_source_ref):
+            raise BundleError("invalid_base_source_ref")
+        changed = b.get("changed_files", {})
+        delete_files = b.get("delete_files", [])
+        if not isinstance(changed, dict) or len(changed) > MAX_SOURCE_FILES:
+            raise BundleError("invalid_changed_files")
+        if (not isinstance(delete_files, list)
+                or len(delete_files) > MAX_SOURCE_FILES
+                or len(set(delete_files)) != len(delete_files)):
+            raise BundleError("invalid_delete_files")
+        if not changed and not delete_files:
+            raise BundleError("successor_no_requested_changes")
+        changed_total = 0
+        for name, text in changed.items():
+            if (not isinstance(name, str) or not FILE_RE.fullmatch(name)
+                    or name == "BUNDLE_SOURCE.json" or not isinstance(text, str)):
+                raise BundleError("invalid_changed_source_entry")
+            data = text.encode("utf-8")
+            changed_total += len(data)
+            if len(data) > MAX_SOURCE_FILE or changed_total > MAX_SOURCE_TOTAL:
+                raise BundleError("source_too_large")
+            sources[name] = data
+        for name in delete_files:
+            if (not isinstance(name, str) or not FILE_RE.fullmatch(name)
+                    or name == "BUNDLE_SOURCE.json"):
+                raise BundleError("invalid_delete_source_entry")
+        if set(changed) & set(delete_files):
+            raise BundleError("successor_change_delete_overlap")
+        if "run_task.py" in delete_files:
+            raise BundleError("cannot_delete_run_task")
+    else:
+        files = b.get("files")
+        hashes = b.get("sha256")
+        if not isinstance(files, dict) or not 1 <= len(files) <= MAX_SOURCE_FILES:
+            raise BundleError("invalid_source_files")
+        if "run_task.py" not in files:
+            raise BundleError("invalid_source_manifest")
+        # V2 retains its exact declared-hash contract. V3 can omit the redundant
+        # client-computed manifest: the immutable Git bundle binds the received
+        # text, and materialize/fetch_task derive and verify its exact UTF-8 bytes.
+        # If a V3 client DOES declare hashes, contradictions still fail closed.
+        if schema == SCHEMA or "sha256" in b:
+            if not isinstance(hashes, dict) or set(hashes) != set(files):
+                raise BundleError("invalid_source_manifest")
+        total = 0
+        for name, text in files.items():
+            if (not FILE_RE.fullmatch(name) or name == "BUNDLE_SOURCE.json"
+                    or not isinstance(text, str)):
+                raise BundleError("invalid_source_entry")
+            data = text.encode("utf-8")
+            total += len(data)
+            if len(data) > MAX_SOURCE_FILE or total > MAX_SOURCE_TOTAL:
+                raise BundleError("source_too_large")
+            if hashes is not None and hashlib.sha256(data).hexdigest() != hashes.get(name):
+                raise BundleError("source_hash_mismatch:" + name)
+            sources[name] = data
 
     inputs = b.get("inputs", {})
     if not isinstance(inputs, dict) or len(inputs) > MAX_INPUT_FILES:
@@ -206,6 +245,119 @@ def validate_bundle(raw, bundle_id):
         raise BundleError("invalid_timeout")
     return b, sources, normalized_inputs, timeout_seconds
 
+
+def _load_base_source(repo, base_source_ref):
+    """Resolve one prior materialized source commit from its immutable ref alone."""
+    if not REF_RE.fullmatch(base_source_ref):
+        raise BundleError("invalid_base_source_ref")
+    commit = api(f"/repos/{safe_repo(repo)}/commits/{base_source_ref}")
+    if not isinstance(commit, dict) or commit.get("sha") != base_source_ref:
+        raise BundleError("invalid_base_source_commit")
+    changed = commit.get("files")
+    if not isinstance(changed, list):
+        raise BundleError("base_source_commit_files_missing")
+    manifest_re = re.compile(
+        r"^transport/tasks/bundle-materialized/(bt-[A-Za-z0-9_.-]{1,64})/BUNDLE_SOURCE[.]json$"
+    )
+    candidates = []
+    for item in changed:
+        filename = item.get("filename", "") if isinstance(item, dict) else ""
+        match = manifest_re.fullmatch(filename)
+        if match:
+            candidates.append((match.group(1), filename))
+    if len(candidates) != 1:
+        raise BundleError("base_source_manifest_not_unique")
+    base_bundle_id, manifest_path = candidates[0]
+    prefix = f"transport/tasks/bundle-materialized/{base_bundle_id}"
+    try:
+        manifest = json.loads(decode_contents(
+            content(repo, manifest_path, base_source_ref), 1024 * 1024
+        ))
+    except Exception as exc:
+        raise BundleError("invalid_base_source_manifest") from exc
+    if (not isinstance(manifest, dict)
+            or manifest.get("schema") not in (SOURCE_SCHEMA, SUCCESSOR_SOURCE_SCHEMA)
+            or manifest.get("bundle_id") != base_bundle_id):
+        raise BundleError("invalid_base_source_manifest")
+    declared = manifest.get("files")
+    if not isinstance(declared, dict) or not 1 <= len(declared) <= MAX_SOURCE_FILES:
+        raise BundleError("invalid_base_source_files")
+    if "run_task.py" not in declared:
+        raise BundleError("invalid_base_source_files")
+    expected_commit_paths = {manifest_path}
+    sources, blob_shas = {}, {}
+    total = 0
+    for name, digest in sorted(declared.items()):
+        if (not isinstance(name, str) or not FILE_RE.fullmatch(name)
+                or name == "BUNDLE_SOURCE.json"
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+            raise BundleError("invalid_base_source_entry")
+        path = f"{prefix}/{name}"
+        expected_commit_paths.add(path)
+        item = content(repo, path, base_source_ref)
+        raw = decode_contents(item, MAX_SOURCE_FILE)
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise BundleError("base_source_hash_mismatch:" + name)
+        total += len(raw)
+        if total > MAX_SOURCE_TOTAL:
+            raise BundleError("base_source_too_large")
+        sources[name] = raw
+        blob_shas[name] = item["sha"]
+    actual_commit_paths = {
+        item.get("filename") for item in changed if isinstance(item, dict)
+    }
+    if actual_commit_paths != expected_commit_paths:
+        raise BundleError("base_source_commit_scope_mismatch")
+    return {
+        "bundle_id": base_bundle_id,
+        "sources": sources,
+        "blob_shas": blob_shas,
+        "manifest": manifest,
+    }
+
+
+def _apply_successor_sources(base_sources, changed_sources, delete_files):
+    final = dict(base_sources)
+    deleted = []
+    for name in delete_files:
+        if name not in final:
+            raise BundleError("successor_delete_missing_file:" + name)
+        del final[name]
+        deleted.append(name)
+
+    actual_changed, unchanged_overlay = [], []
+    for name, raw in changed_sources.items():
+        if name in base_sources and base_sources[name] == raw:
+            unchanged_overlay.append(name)
+            continue
+        final[name] = raw
+        actual_changed.append(name)
+
+    if "run_task.py" not in final:
+        raise BundleError("invalid_final_source_manifest")
+    if not 1 <= len(final) <= MAX_SOURCE_FILES:
+        raise BundleError("invalid_final_source_manifest")
+    total = 0
+    for name, raw in final.items():
+        if (not FILE_RE.fullmatch(name) or name == "BUNDLE_SOURCE.json"
+                or not isinstance(raw, (bytes, bytearray))):
+            raise BundleError("invalid_final_source_entry")
+        total += len(raw)
+        if len(raw) > MAX_SOURCE_FILE or total > MAX_SOURCE_TOTAL:
+            raise BundleError("source_too_large")
+    if not actual_changed and not deleted:
+        raise BundleError("successor_no_effect")
+    inherited = sorted(name for name in final if name not in actual_changed)
+    return final, {
+        "requested_changed_files": sorted(changed_sources),
+        "actual_changed_files": sorted(actual_changed),
+        "unchanged_overlay_files": sorted(unchanged_overlay),
+        "deleted_files": sorted(deleted),
+        "inherited_files": inherited,
+    }
+
+
 def recovery_branch(bundle_id, phase):
     run = os.environ.get("GITHUB_RUN_ID", "0")
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "0")
@@ -214,10 +366,20 @@ def recovery_branch(bundle_id, phase):
     suffix = hashlib.sha256((bundle_id + ":" + phase).encode()).hexdigest()[:12]
     return f"recovery-actions-{run}-{attempt}-{suffix}"
 
-def put_create_only(repo, files, message, recovery_ref=None):
+def put_create_only(repo, files, message, recovery_ref=None, known_blob_shas=None):
     from private_io import _set_recovery_ref, _clear_recovery_ref
     repo = safe_repo(repo)
     blob_shas = {}
+    known_blob_shas = dict(known_blob_shas or {})
+    if set(known_blob_shas) - set(files):
+        raise BundleError("known_blob_path_not_in_files")
+    for path, raw in files.items():
+        known = known_blob_shas.get(path)
+        if known is not None:
+            expected = hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest()
+            if not BLOB_RE.fullmatch(known) or known != expected:
+                raise BundleError("known_blob_identity_mismatch:" + path)
+            blob_shas[path] = known
     for path, raw in files.items():
         safe_path(path)
         if not isinstance(raw, (bytes, bytearray)):
@@ -297,7 +459,7 @@ def materialize(repo, bundle_id):
     bundle_path = f"transport/bundle_inbox/{bundle_id}.json"
     item = content(repo, bundle_path, "main")
     raw = decode_contents(item, 1024 * 1024)
-    bundle, sources, inputs, timeout_seconds = validate_bundle(raw, bundle_id)
+    bundle, submitted_sources, inputs, timeout_seconds = validate_bundle(raw, bundle_id)
 
     complete_path = f"transport/bundle-executions/{bundle_id}/completed.json"
     try:
@@ -317,9 +479,21 @@ def materialize(repo, bundle_id):
         print("MATERIALIZE_STAGE=already-completed")
         return
 
+    successor = None
+    known_blob_shas = {}
+    if bundle["schema"] == SUCCESSOR_SCHEMA:
+        base = _load_base_source(repo, bundle["base_source_ref"])
+        sources, successor = _apply_successor_sources(
+            base["sources"], submitted_sources, bundle.get("delete_files", [])
+        )
+        if set(inputs) & set(sources):
+            raise BundleError("input_source_name_collision")
+    else:
+        sources = submitted_sources
+
     prefix = f"transport/tasks/bundle-materialized/{bundle_id}"
     source_manifest = {
-        "schema": SOURCE_SCHEMA,
+        "schema": SUCCESSOR_SOURCE_SCHEMA if successor is not None else SOURCE_SCHEMA,
         "bundle_id": bundle_id,
         "bundle_path": bundle_path,
         "bundle_blob": item["sha"],
@@ -330,12 +504,32 @@ def materialize(repo, bundle_id):
     if bundle["schema"] == TEXT_SCHEMA:
         source_manifest["submission_schema"] = TEXT_SCHEMA
         source_manifest["source_hash_authority"] = "actions_received_utf8"
+    elif bundle["schema"] == SUCCESSOR_SCHEMA:
+        source_manifest["submission_schema"] = SUCCESSOR_SCHEMA
+        source_manifest["source_hash_authority"] = "actions_received_utf8_overlay"
+        source_manifest["parent_source_ref"] = bundle["base_source_ref"]
+        source_manifest["parent_bundle_id"] = base["bundle_id"]
+        source_manifest.update(successor)
+        for name in successor["inherited_files"]:
+            if name in base["blob_shas"] and sources[name] == base["sources"][name]:
+                known_blob_shas[f"{prefix}/{name}"] = base["blob_shas"][name]
+
     formal = {f"{prefix}/{name}": data for name, data in sources.items()}
     formal[f"{prefix}/BUNDLE_SOURCE.json"] = (
         json.dumps(source_manifest, indent=2, sort_keys=True) + "\n"
     ).encode()
-    source_ref = put_create_only(repo, formal, "Materialize validated private task bundle",
-                                 recovery_ref=recovery_branch(bundle_id, "source"))
+    if successor is not None:
+        source_ref = put_create_only(
+            repo, formal, "Materialize validated private task bundle",
+            recovery_ref=recovery_branch(bundle_id, "source"),
+            known_blob_shas=known_blob_shas,
+        )
+    else:
+        # Preserve the V2/V3 publisher call shape exactly for compatibility.
+        source_ref = put_create_only(
+            repo, formal, "Materialize validated private task bundle",
+            recovery_ref=recovery_branch(bundle_id, "source"),
+        )
 
     for name, data in sources.items():
         got = decode_contents(content(repo, f"{prefix}/{name}", source_ref), MAX_SOURCE_FILE)
@@ -348,6 +542,7 @@ def materialize(repo, bundle_id):
     append_output("skip", "false")
     print("MATERIALIZE_STAGE=complete")
 
+
 def fetch_task(repo, bundle_id, source_ref, dest):
     if not REF_RE.fullmatch(source_ref):
         raise BundleError("invalid_source_ref")
@@ -356,7 +551,8 @@ def fetch_task(repo, bundle_id, source_ref, dest):
         content(repo, f"{prefix}/BUNDLE_SOURCE.json", source_ref), 1024 * 1024
     )
     manifest = json.loads(manifest_raw)
-    if manifest.get("schema") != SOURCE_SCHEMA or manifest.get("bundle_id") != bundle_id:
+    if (manifest.get("schema") not in (SOURCE_SCHEMA, SUCCESSOR_SOURCE_SCHEMA)
+            or manifest.get("bundle_id") != bundle_id):
         raise BundleError("source_manifest_identity")
     target = Path(dest)
     target.mkdir(mode=0o700, parents=True, exist_ok=False)
