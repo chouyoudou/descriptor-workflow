@@ -486,6 +486,8 @@ def materialize(repo, bundle_id):
         sources, successor = _apply_successor_sources(
             base["sources"], submitted_sources, bundle.get("delete_files", [])
         )
+        if set(inputs) & set(sources):
+            raise BundleError("input_source_name_collision")
     else:
         sources = submitted_sources
 
