@@ -544,7 +544,8 @@ def fetch_task(repo, bundle_id, source_ref, dest):
         content(repo, f"{prefix}/BUNDLE_SOURCE.json", source_ref), 1024 * 1024
     )
     manifest = json.loads(manifest_raw)
-    if (manifest.get("schema") not in (SOURCE_SCHEMA, SUCCESSOR_SOURCE_SCHEMA)\n            or manifest.get("bundle_id") != bundle_id):
+    if (manifest.get("schema") not in (SOURCE_SCHEMA, SUCCESSOR_SOURCE_SCHEMA)
+            or manifest.get("bundle_id") != bundle_id):
         raise BundleError("source_manifest_identity")
     target = Path(dest)
     target.mkdir(mode=0o700, parents=True, exist_ok=False)
