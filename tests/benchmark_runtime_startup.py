@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--baseline', type=Path, required=True)
     parser.add_argument('--archive', type=Path, required=True)
     parser.add_argument('--base-image', required=True)
+    parser.add_argument('--dockerfile', type=Path, default=Path('public_env/runtime.Dockerfile'))
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--pairs', type=int, default=3)
     args = parser.parse_args()
@@ -29,7 +30,7 @@ def main():
     lock = Path('public_env/resolved.lock')
     dependencies = Path('public_env/public_deps.py')
     identity_args = dict(lock=lock, manifest=Path('public_env/wheel-manifest.lock.json'),
-                         dockerfile=Path('public_env/runtime.Dockerfile'), base_image=args.base_image)
+                         dockerfile=args.dockerfile, base_image=args.base_image)
     identity = current.profile_identity(**identity_args)
     assert identity == baseline.profile_identity(**identity_args), 'runtime identity changed'
     restore_seconds = max(0, (time.time_ns()-int(os.environ['RESTORE_START_NS']))/1e9)
