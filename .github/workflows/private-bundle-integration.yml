@@ -40,13 +40,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Admit bundle before runtime setup
+      - name: Recover prior result or admit a new execution
         id: materialize
         env:
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
           set -euo pipefail
-          python3 bundle_ingress.py admit \
+          python3 bundle_result_recovery.py \
             --repo "$PRIVATE_REPOSITORY" \
             --bundle-id "${{ needs.resolve.outputs.bundle_id }}"
 
