@@ -1,0 +1,59 @@
+name: Public runtime startup comparison
+on:
+  pull_request:
+    paths:
+      - "public_env/runtime_cache.py"
+      - "tests/test_runtime_verification.py"
+      - "tests/benchmark_runtime_startup.py"
+      - ".github/workflows/runtime-feedback.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+cache-mode: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BASELINE_COMMIT: d2d5e9ee23825ee97ffe0a79fe420871caf706d6
+      PYTHON_IMAGE: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Unit checks and immutable baseline
+        run: |
+          python3 -m unittest discover -s tests -v
+          git show "$BASELINE_COMMIT:public_env/runtime_cache.py" > "$RUNNER_TEMP/runtime-cache-baseline.py"
+      - name: Derive unchanged public runtime identity
+        id: profile
+        run: |
+          python3 public_env/runtime_cache.py identity \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" --github-output "$GITHUB_OUTPUT"
+      - name: Mark cache restore start
+        run: echo "RESTORE_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+      - name: Restore existing exact public image without saving
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-runtime-cache
+          key: public-runtime-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.profile_digest }}
+          fail-on-cache-miss: true
+      - name: Measure load and alternate full-check implementations
+        run: |
+          python3 tests/benchmark_runtime_startup.py \
+            --baseline "$RUNNER_TEMP/runtime-cache-baseline.py" \
+            --archive .public-runtime-cache/runtime.tar \
+            --base-image "$PYTHON_IMAGE" --pairs 3 \
+            --output out/runtime-feedback/comparison.json
+      - name: Save public timing evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: runtime-feedback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/runtime-feedback/comparison.json
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 14
