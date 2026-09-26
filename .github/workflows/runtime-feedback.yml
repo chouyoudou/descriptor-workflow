@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - "public_env/runtime_cache.py"
+      - "public_env/runtime.Dockerfile"
       - "tests/test_runtime_verification.py"
       - "tests/benchmark_runtime_startup.py"
       - ".github/workflows/runtime-feedback.yml"
@@ -26,13 +27,14 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -v
           git show "$BASELINE_COMMIT:public_env/runtime_cache.py" > "$RUNNER_TEMP/runtime-cache-baseline.py"
-      - name: Derive unchanged public runtime identity
+          git show "$BASELINE_COMMIT:public_env/runtime.Dockerfile" > "$RUNNER_TEMP/runtime-baseline.Dockerfile"
+      - name: Derive baseline public runtime identity
         id: profile
         run: |
           python3 public_env/runtime_cache.py identity \
             --lock public_env/resolved.lock \
             --manifest public_env/wheel-manifest.lock.json \
-            --dockerfile public_env/runtime.Dockerfile \
+            --dockerfile "$RUNNER_TEMP/runtime-baseline.Dockerfile" \
             --base-image "$PYTHON_IMAGE" --github-output "$GITHUB_OUTPUT"
       - name: Mark cache restore start
         run: echo "RESTORE_START_NS=$(date +%s%N)" >> "$GITHUB_ENV"
@@ -42,18 +44,96 @@ jobs:
           path: .public-runtime-cache
           key: public-runtime-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.profile.outputs.profile_digest }}
           fail-on-cache-miss: true
-      - name: Measure load and alternate full-check implementations
+      - name: Measure baseline load and alternate full-check implementations
         run: |
           python3 tests/benchmark_runtime_startup.py \
             --baseline "$RUNNER_TEMP/runtime-cache-baseline.py" \
+            --dockerfile "$RUNNER_TEMP/runtime-baseline.Dockerfile" \
             --archive .public-runtime-cache/runtime.tar \
             --base-image "$PYTHON_IMAGE" --pairs 3 \
             --output out/runtime-feedback/comparison.json
+          docker tag descriptor-direct-runtime:current descriptor-direct-runtime:baseline
+      - name: Restore exact public wheelhouse for lean image build
+        id: wheels
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: .public-wheelhouse
+          key: public-wheelhouse-v2-${{ runner.os }}-${{ runner.arch }}-cp312-${{ hashFiles('public_env/resolved.lock', 'public_env/wheel-manifest.lock.json') }}
+      - name: Derive proposed runtime identity
+        id: proposed
+        run: |
+          python3 public_env/runtime_cache.py identity \
+            --lock public_env/resolved.lock \
+            --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile \
+            --base-image "$PYTHON_IMAGE" --github-output "$GITHUB_OUTPUT"
+      - name: Build with temporary wheel mount and retain full checks
+        run: |
+          set -euo pipefail
+          mkdir -p .public-wheelhouse
+          if [ "${{ steps.wheels.outputs.cache-hit }}" != "true" ]; then
+            python3 -m pip download --only-binary=:all: --no-deps \
+              --dest .public-wheelhouse -r public_env/resolved.lock --quiet
+          fi
+          python3 public_env/public_deps.py verify-wheelhouse \
+            .public-wheelhouse public_env/wheel-manifest.lock.json
+          build="$RUNNER_TEMP/runtime-feedback-build"
+          install -d -m 0700 "$build"
+          cp -a .public-wheelhouse "$build/wheelhouse"
+          cp public_env/resolved.lock "$build/resolved.lock"
+          cp public_env/runtime.Dockerfile "$build/runtime.Dockerfile"
+          start="$(date +%s%N)"
+          docker build -f "$build/runtime.Dockerfile" \
+            --build-arg BASE_IMAGE="$PYTHON_IMAGE" \
+            --build-arg PROFILE_DIGEST="${{ steps.proposed.outputs.profile_digest }}" \
+            --build-arg LOCK_SHA256="${{ steps.proposed.outputs.lock_sha256 }}" \
+            -t descriptor-direct-runtime:current "$build" > "$RUNNER_TEMP/public-runtime-build.log" 2>&1
+          echo "BUILD_START_NS=$start" >> "$GITHUB_ENV"
+          echo "BUILD_END_NS=$(date +%s%N)" >> "$GITHUB_ENV"
+          python3 public_env/runtime_cache.py verify-image \
+            --image descriptor-direct-runtime:current \
+            --lock public_env/resolved.lock --manifest public_env/wheel-manifest.lock.json \
+            --dockerfile public_env/runtime.Dockerfile --base-image "$PYTHON_IMAGE" \
+            --public-deps public_env/public_deps.py \
+            --json-output out/runtime-feedback/verification.json >/dev/null
+          docker save descriptor-direct-runtime:current -o "$RUNNER_TEMP/lean-runtime.tar"
+      - name: Compare actual archive and native identity evidence
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          root = pathlib.Path('out/runtime-feedback')
+          baseline = json.loads((root/'comparison.json').read_text())
+          proposed = json.loads((root/'verification.json').read_text())
+          old = baseline['trials'][0]['verification']
+          assert old['installed_check'] == proposed['installed_check']
+          assert old['smoke'] == proposed['smoke']
+          def native(image):
+              code = ('import json,pathlib,hashlib; p=pathlib.Path("/usr/local/share/zeopp/identity.json"); '
+                      'x=json.loads(p.read_text()); assert x["binary_sha256"]==hashlib.sha256(pathlib.Path("/usr/local/bin/network").read_bytes()).hexdigest(); '
+                      'assert pathlib.Path("/usr/local/share/zeopp/LICENSE").is_file(); print(json.dumps(x))')
+              return json.loads(subprocess.check_output(['docker','run','--rm','--network','none',
+                  '--read-only','--cap-drop','ALL','--security-opt','no-new-privileges:true',
+                  image,'python3','-B','-c',code], text=True))
+          old_native, new_native = native('descriptor-direct-runtime:baseline'), native('descriptor-direct-runtime:current')
+          for key in ('source_commit','source_archive_sha256','compiler','build_flags'):
+              assert old_native[key] == new_native[key], key
+          size = (pathlib.Path(os.environ['RUNNER_TEMP'])/'lean-runtime.tar').stat().st_size
+          report = {'schema':'public-runtime-image-size-comparison/1',
+                    'baseline_archive_bytes':baseline['runtime_archive_bytes'],
+                    'proposed_archive_bytes':size,
+                    'archive_bytes_saved':baseline['runtime_archive_bytes']-size,
+                    'build_seconds':(int(os.environ['BUILD_END_NS'])-int(os.environ['BUILD_START_NS']))/1e9,
+                    'same_installed_versions_and_smoke':True,
+                    'baseline_native':old_native,'proposed_native':new_native,
+                    'load_time_note':'Fresh-runner load is measured after cache publication; a same-daemon reload would reuse layers.'}
+          (root/'lean-image.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(report))
+          PY
       - name: Save public timing evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: runtime-feedback-${{ github.run_id }}-${{ github.run_attempt }}
-          path: out/runtime-feedback/comparison.json
+          path: out/runtime-feedback/*.json
           if-no-files-found: error
           overwrite: false
           retention-days: 14
