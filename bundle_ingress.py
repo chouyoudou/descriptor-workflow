@@ -85,7 +85,7 @@ def validate_run_request(control, request, bundle_id):
     if {"files", "changed_files", "delete_files", "sha256", "base_source_ref"} & request.keys():
         raise ValueError("run_request_cannot_edit_source")
     inputs = request.get("inputs", {})
-    if not isinstance(inputs, dict) or len(inputs) > control.MAX_INPUT_FILES:
+    if not isinstance(inputs, dict):
         raise ValueError("invalid_inputs")
     normalized = {}
     for name, spec in inputs.items():
@@ -239,13 +239,9 @@ def fetch_task(repo, bundle_id, source_ref, bundle_blob, dest, control=None):
             path.chmod(0o400)
         for name, data in base["sources"].items():
             write(name, data)
-        total = 0
         for name, spec in inputs.items():
             data = control.read_pinned_file(
-                repo, spec["path"], spec["ref"], spec["blob"], control.MAX_INPUT_FILE)
-            total += len(data)
-            if total > control.MAX_INPUT_TOTAL:
-                raise ValueError("input_total_too_large")
+                repo, spec["path"], spec["ref"], spec["blob"])
             write(name, data)
         if config is not None:
             write(CONFIG_NAME, config)

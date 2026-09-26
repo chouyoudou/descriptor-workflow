@@ -40,10 +40,6 @@ ALLOWED_INPUT_PREFIXES = (
     "transport/recovered/",
     "transport/tasks/",
 )
-MAX_INPUT_FILES = 16
-MAX_INPUT_FILE = 32 * 1024 * 1024
-MAX_INPUT_TOTAL = 96 * 1024 * 1024
-MAX_OUTPUT_FILE = 32 * 1024 * 1024
 
 class BundleError(RuntimeError):
     pass
@@ -139,8 +135,8 @@ def read_repository_file(repo, path, ref, limit=None, expected_blob=None):
         raise BundleError("blob_identity_mismatch")
     return decode_contents({**blob_item, "type": "file"}, limit), blob
 
-def read_pinned_file(repo, path, ref, blob, limit):
-    """Read a pinned private input; input limits remain a separate contract."""
+def read_pinned_file(repo, path, ref, blob, limit=None):
+    """Read one immutable pinned private input; local byte quotas are not imposed."""
     raw, _ = read_repository_file(repo, path, ref, limit=limit, expected_blob=blob)
     return raw
 
@@ -228,7 +224,7 @@ def validate_bundle(raw, bundle_id):
             sources[name] = data
 
     inputs = b.get("inputs", {})
-    if not isinstance(inputs, dict) or len(inputs) > MAX_INPUT_FILES:
+    if not isinstance(inputs, dict):
         raise BundleError("invalid_inputs")
     normalized_inputs = {}
     for local, spec in inputs.items():
@@ -560,7 +556,6 @@ def fetch_task(repo, bundle_id, source_ref, dest):
     target = Path(dest)
     target.mkdir(mode=0o700, parents=True, exist_ok=False)
 
-    total_inputs = 0
     for name, digest in manifest["files"].items():
         raw, _ = read_repository_file(repo, f"{prefix}/{name}", source_ref)
         if hashlib.sha256(raw).hexdigest() != digest:
@@ -570,10 +565,7 @@ def fetch_task(repo, bundle_id, source_ref, dest):
         p.chmod(0o400)
 
     for local, spec in manifest.get("inputs", {}).items():
-        raw = read_pinned_file(repo, spec["path"], spec["ref"], spec["blob"], MAX_INPUT_FILE)
-        total_inputs += len(raw)
-        if total_inputs > MAX_INPUT_TOTAL:
-            raise BundleError("input_total_too_large")
+        raw = read_pinned_file(repo, spec["path"], spec["ref"], spec["blob"])
         p = target / local
         p.write_bytes(raw)
         p.chmod(0o400)
@@ -603,17 +595,13 @@ def validate_jsonl(path, expected_rows):
 def publish(repo, bundle_id, source_ref, bundle_blob, output):
     from private_io import inspect_result_jsonl, inspect_progress_jsonl
     out = Path(output)
-    allowed = {
-        "result.jsonl", "summary.json", "focused-and-batch.log", "progress.jsonl",
-        "execution.stdout.log", "execution.stderr.log", "execution.json",
-    }
+    reserved = {"receipt.json", "admission.json"}
     collected = {}
     for p in out.iterdir() if out.exists() else ():
         st = p.lstat()
-        if p.name not in allowed or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        if (p.name in reserved or "/" in p.name or "\\" in p.name
+                or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1):
             raise BundleError("unexpected_output_file:" + p.name)
-        if st.st_size > MAX_OUTPUT_FILE:
-            raise BundleError("output_too_large:" + p.name)
         collected[p.name] = p.read_bytes()
 
     errors = []
@@ -631,8 +619,6 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
             return {}
     summary = parse_metadata("summary.json")
     execution = parse_metadata("execution.json")
-    if "focused-and-batch.log" not in collected:
-        errors.append("missing_focused_log")
     expected_rows = summary.get("rows")
     result_validation = inspect_result_jsonl(out / "result.jsonl", expected_rows)
     progress_validation = inspect_progress_jsonl(out / "progress.jsonl", execution)
