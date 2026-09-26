@@ -84,35 +84,29 @@ class OutputPolicyTests(unittest.TestCase):
             self.assertGreater(len(captured[key]), 32 * 1024 * 1024)
 
     def test_reserved_or_nonregular_output_still_fails(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp)
-            self._success_output(out)
-            (out / "receipt.json").write_text("{}\n")
-            with mock.patch.dict(os.environ, {
-                "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"
-            }):
-                with self.assertRaisesRegex(
-                    bc.BundleError, "unexpected_output_file:receipt.json"
-                ):
-                    bc.publish(
-                        "owner/private", "bt-output-unit",
-                        "b" * 40, "a" * 40, out
-                    )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp)
-            self._success_output(out)
-            (out / "nested").mkdir()
-            with mock.patch.dict(os.environ, {
-                "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"
-            }):
-                with self.assertRaisesRegex(
-                    bc.BundleError, "unexpected_output_file:nested"
-                ):
-                    bc.publish(
-                        "owner/private", "bt-output-unit",
-                        "b" * 40, "a" * 40, out
-                    )
+        for name in ("receipt.json", "nested"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp)
+                self._success_output(out)
+                if name == "nested":
+                    (out / name).mkdir()
+                else:
+                    (out / name).write_text("{}\n")
+                with mock.patch.object(bc, "put_create_only", return_value="c" * 40) as put, \
+                     mock.patch.dict(os.environ, {
+                         "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"
+                     }):
+                    with self.assertRaisesRegex(bc.BundleError, "failed_execution_preserved"):
+                        bc.publish("owner/private", "bt-output-unit", "b" * 40, "a" * 40, out)
+                put.assert_called_once()
+                saved = put.call_args.args[1]
+                prefix = "transport/bundle-executions/bt-output-unit/123-1/"
+                receipt = json.loads(saved[prefix + "receipt.json"])
+                self.assertEqual(receipt["status"], "failed_or_partial")
+                self.assertEqual(receipt["collection_errors"][0]["name"], name)
+                self.assertNotIn(name, receipt["files"])
+                self.assertIn(prefix + "result.jsonl", saved)
+                self.assertNotIn("transport/bundle-executions/bt-output-unit/completed.json", saved)
 
 
 if __name__ == "__main__":
