@@ -130,18 +130,30 @@ def put_files(repo, files, recovery_branch=None):
         safe_path(path)
         if not isinstance(raw, (bytes, bytearray)):
             raise PrivateIOError("invalid_file_bytes")
+    from git_publication_snapshot import existing_blob_snapshot, TreeSnapshotError
     for attempt in range(7):
         try:
             parent = api(f"/repos/{repo}/git/ref/heads/main")["object"]["sha"]
+            try:
+                tree, existing = existing_blob_snapshot(api, repo, parent, files)
+            except TreeSnapshotError as exc:
+                raise PrivateIOError(str(exc)) from exc
             entries = []
             for path, raw in files.items():
-                try:
-                    old = content(repo, path, parent)
-                except urllib.error.HTTPError as exc:
-                    if exc.code != 404:
-                        raise
+                expected = blob_sha(raw)
+                if existing is None:
+                    try:
+                        old = content(repo, path, parent)
+                    except urllib.error.HTTPError as exc:
+                        if exc.code != 404:
+                            raise
+                        old_sha = None
+                    else:
+                        old_sha = old["sha"]
                 else:
-                    if old["sha"] != blob_sha(raw):
+                    old_sha = existing[path]
+                if old_sha is not None:
+                    if old_sha != expected:
                         raise PrivateIOError("refuse_different_existing_file")
                     continue
                 if path not in blob_shas:
@@ -155,7 +167,6 @@ def put_files(repo, files, recovery_branch=None):
                 if recovery_branch is not None:
                     _clear_recovery_ref(repo, recovery_branch)
                 return parent
-            tree = api(f"/repos/{repo}/git/commits/{parent}")["tree"]["sha"]
             new_tree = api(f"/repos/{repo}/git/trees", "POST",
                            {"base_tree": tree, "tree": entries})["sha"]
             commit = api(f"/repos/{repo}/git/commits", "POST",
