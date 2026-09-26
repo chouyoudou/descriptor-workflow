@@ -190,6 +190,8 @@ class RecoveryRefTests(unittest.TestCase):
                 return {"sha": "blob"}
             if path.endswith("/git/commits/parent") and method == "GET":
                 return {"tree": {"sha": "tree0"}}
+            if path.endswith("/git/trees/tree0?recursive=1") and method == "GET":
+                return {"truncated": False, "tree": []}
             if path.endswith("/git/trees") and method == "POST":
                 return {"sha": "tree1"}
             if path.endswith("/git/commits") and method == "POST":
@@ -505,6 +507,7 @@ class BundleRecoveryTests(unittest.TestCase):
             if path.endswith('/git/ref/heads/main'):return {'object':{'sha':'parent'}}
             if path.endswith('/git/blobs'):return {'sha':'blob'}
             if path.endswith('/git/commits/parent'):return {'tree':{'sha':'base'}}
+            if path.endswith('/git/trees/base?recursive=1'):return {'truncated':False,'tree':[]}
             if path.endswith('/git/trees'):return {'sha':'tree'}
             if path.endswith('/git/commits'):return {'sha':'commit'}
             if path.endswith('/git/refs/heads/main'):return {'object':{'sha':'commit'}}
