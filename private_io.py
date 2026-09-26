@@ -500,13 +500,13 @@ def execute(task_dir, output_dir, image, timeout):
 def publish(state_path, output_dir):
     state = json.loads(Path(state_path).read_text())
     out = Path(output_dir)
-    allowed = {"result.jsonl", "summary.json", "focused-and-batch.log", "progress.jsonl",
-               "execution.stdout.log", "execution.stderr.log", "execution.json"}
+    reserved = {"receipt.json", "admission.json"}
     files, descriptions = {}, {}
     if out.exists():
         for path in out.iterdir():
             st = path.lstat()
-            if path.name not in allowed or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > 32*1024*1024:
+            if (path.name in reserved or "/" in path.name or "\\" in path.name
+                    or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1):
                 raise PrivateIOError("unexpected_output_file")
             raw = path.read_bytes()
             files[state["destination"] + "/" + path.name] = raw
