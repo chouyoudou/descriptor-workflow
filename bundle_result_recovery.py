@@ -64,6 +64,8 @@ def receipt_identity(receipt, bundle_id, bundle_blob, producer=None):
             or not HEX.fullmatch(receipt.get("source_ref", ""))
             or receipt.get("status") not in ("materialized", "failed_or_partial")):
         raise ValueError("result_identity_mismatch")
+    if receipt["status"] == "materialized" and receipt.get("collection_errors"):
+        raise ValueError("false_completion_rejected")
     identity = str(receipt.get("run_id", "")) + "-" + str(receipt.get("run_attempt", ""))
     if not ATTEMPT.fullmatch(identity) or (producer is not None and identity != producer):
         raise ValueError("producer_identity_mismatch")
