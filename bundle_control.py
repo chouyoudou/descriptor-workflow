@@ -7,6 +7,7 @@ to the existing private_io.py container boundary and receives no token/network.
 from __future__ import annotations
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -366,6 +367,45 @@ def recovery_branch(bundle_id, phase):
     suffix = hashlib.sha256((bundle_id + ":" + phase).encode()).hexdigest()[:12]
     return f"recovery-actions-{run}-{attempt}-{suffix}"
 
+
+def _create_missing_blobs(repo, missing, blob_shas, max_workers=4):
+    """Create independent Git blobs concurrently while keeping ref updates serial.
+
+    Successful blob SHAs are retained in blob_shas even if a sibling upload
+    fails, so an outer retry does not recreate already accepted objects.
+    """
+    if not missing:
+        return
+
+    def create_one(path, raw):
+        item = api(
+            f"/repos/{repo}/git/blobs", "POST",
+            {"content": base64.b64encode(raw).decode(), "encoding": "base64"},
+        )
+        sha = item.get("sha") if isinstance(item, dict) else None
+        if not BLOB_RE.fullmatch(sha or ""):
+            raise BundleError("invalid_created_blob:" + path)
+        return path, sha
+
+    if len(missing) == 1 or max_workers <= 1:
+        path, sha = create_one(*missing[0])
+        blob_shas[path] = sha
+        return
+
+    first_error = None
+    workers = min(max_workers, len(missing))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="git-blob") as pool:
+        futures = [pool.submit(create_one, path, raw) for path, raw in missing]
+        for future in as_completed(futures):
+            try:
+                path, sha = future.result()
+                blob_shas[path] = sha
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+    if first_error is not None:
+        raise first_error
+
 def put_create_only(repo, files, message, recovery_ref=None, known_blob_shas=None):
     from private_io import _set_recovery_ref, _clear_recovery_ref
     repo = safe_repo(repo)
@@ -393,7 +433,7 @@ def put_create_only(repo, files, message, recovery_ref=None, known_blob_shas=Non
                 tree, existing = existing_blob_snapshot(api, repo, parent, files)
             except TreeSnapshotError as exc:
                 raise BundleError(str(exc)) from exc
-            entries = []
+            missing = []
             for path, raw in files.items():
                 expected = hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest()
                 if existing is None:
@@ -411,15 +451,14 @@ def put_create_only(repo, files, message, recovery_ref=None, known_blob_shas=Non
                     if old_sha == expected:
                         continue
                     raise BundleError("refuse_different_existing_file:" + path)
-                if path not in blob_shas:
-                    blob_shas[path] = api(
-                        f"/repos/{repo}/git/blobs", "POST",
-                        {"content": base64.b64encode(raw).decode(), "encoding": "base64"},
-                    )["sha"]
-                entries.append({
-                    "path": path, "mode": "100644", "type": "blob",
-                    "sha": blob_shas[path],
-                })
+                missing.append((path, raw))
+
+            to_create = [(path, raw) for path, raw in missing if path not in blob_shas]
+            _create_missing_blobs(repo, to_create, blob_shas)
+            entries = [{
+                "path": path, "mode": "100644", "type": "blob",
+                "sha": blob_shas[path],
+            } for path, _ in missing]
             if not entries:
                 if recovery_ref:
                     _clear_recovery_ref(repo, recovery_ref)
