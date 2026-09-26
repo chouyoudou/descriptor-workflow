@@ -414,10 +414,8 @@ def put_create_only(repo, files, message, recovery_ref=None, known_blob_shas=Non
                     _clear_recovery_ref(repo, recovery_ref)
                 return parent
             tree = api(f"/repos/{repo}/git/commits/{parent}")["tree"]["sha"]
-            new_tree = api(
-                f"/repos/{repo}/git/trees", "POST",
-                {"base_tree": tree, "tree": entries},
-            )["sha"]
+            new_tree = api(f"/repos/{repo}/git/trees", "POST",
+                           {"base_tree": tree, "tree": entries})["sha"]
             commit = api(
                 f"/repos/{repo}/git/commits", "POST",
                 {"message": message, "tree": new_tree, "parents": [parent]},
@@ -593,16 +591,8 @@ def validate_jsonl(path, expected_rows):
     return count
 
 def publish(repo, bundle_id, source_ref, bundle_blob, output):
-    from private_io import inspect_result_jsonl, inspect_progress_jsonl
-    out = Path(output)
-    reserved = {"receipt.json", "admission.json"}
-    collected = {}
-    for p in out.iterdir() if out.exists() else ():
-        st = p.lstat()
-        if (p.name in reserved or "/" in p.name or "\\" in p.name
-                or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1):
-            raise BundleError("unexpected_output_file:" + p.name)
-        collected[p.name] = p.read_bytes()
+    from bundle_output_collection import collect_output, inspect_collected
+    collected, collection_errors = collect_output(output)
 
     errors = []
     def parse_metadata(name):
@@ -620,8 +610,9 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
     summary = parse_metadata("summary.json")
     execution = parse_metadata("execution.json")
     expected_rows = summary.get("rows")
-    result_validation = inspect_result_jsonl(out / "result.jsonl", expected_rows)
-    progress_validation = inspect_progress_jsonl(out / "progress.jsonl", execution)
+    result_validation, progress_validation = inspect_collected(
+        collected, expected_rows, execution
+    )
     success = (
         summary.get("stage") == "materialized"
         and execution.get("exit_code") == 0
@@ -630,6 +621,7 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
         and type(expected_rows) is int and expected_rows > 0
         and result_validation.get("status") == "valid"
         and not errors
+        and not collection_errors
     )
     actual_rows = result_validation.get("records", 0)
 
@@ -649,6 +641,7 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
         "result_validation": result_validation,
         "progress": progress_validation,
         "metadata_errors": errors,
+        "collection_errors": collection_errors,
     }
     files = {f"{prefix}/{name}": raw for name, raw in collected.items()}
     files[f"{prefix}/receipt.json"] = (
