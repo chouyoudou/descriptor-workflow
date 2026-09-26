@@ -229,6 +229,8 @@ class BlobReuseTests(unittest.TestCase):
                 return {"sha": git_blob(raw)}
             if method == "GET" and path.endswith("/git/commits/" + parent):
                 return {"tree": {"sha": tree}}
+            if method == "GET" and path.endswith("/git/trees/" + tree + "?recursive=1"):
+                return {"truncated": False, "tree": []}
             if method == "POST" and path.endswith("/git/trees"):
                 return {"sha": new_tree}
             if method == "POST" and path.endswith("/git/commits"):
