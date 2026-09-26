@@ -592,7 +592,7 @@ class BundleRecoveryTests(unittest.TestCase):
         def api(path,method='GET',body=None):
             calls.append((path,method))
             if path.endswith('/git/ref/heads/main'):return {'object':{'sha':'parent'}}
-            if path.endswith('/git/blobs'):return {'sha':'blob'}
+            if path.endswith('/git/blobs'):return {'sha':pio.blob_sha(b'fixture')}
             if path.endswith('/git/commits/parent'):return {'tree':{'sha':'base'}}
             if path.endswith('/git/trees/base?recursive=1'):return {'truncated':False,'tree':[]}
             if path.endswith('/git/trees'):return {'sha':'tree'}
