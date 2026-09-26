@@ -5,6 +5,7 @@ import json
 import base64
 import hashlib
 from pathlib import Path
+import threading
 import tempfile
 import unittest
 import urllib.error
@@ -500,12 +501,98 @@ class BundleRecoveryTests(unittest.TestCase):
         self.assertEqual(bc._retry_delay(error,0),600)
         self.assertGreaterEqual(bc._retry_delay(urllib.error.HTTPError('u',429,'limited',{},None),0),60)
 
+    def test_create_only_parallelizes_new_blobs_but_keeps_commit_steps_serial(self):
+        files = {f"transport/x/{i}.txt": f"value-{i}".encode() for i in range(4)}
+        barrier = threading.Barrier(4)
+        lock = threading.Lock()
+        blob_threads = set()
+        calls = []
+
+        def fake_api(path, method="GET", body=None):
+            with lock:
+                calls.append((path, method))
+            if path.endswith("/git/ref/heads/main") and method == "GET":
+                return {"object": {"sha": "parent"}}
+            if path.endswith("/git/commits/parent") and method == "GET":
+                return {"tree": {"sha": "base"}}
+            if path.endswith("/git/trees/base?recursive=1") and method == "GET":
+                return {"truncated": False, "tree": []}
+            if path.endswith("/git/blobs") and method == "POST":
+                with lock:
+                    blob_threads.add(threading.get_ident())
+                barrier.wait(timeout=2)
+                raw = base64.b64decode(body["content"])
+                return {"sha": pio.blob_sha(raw)}
+            if path.endswith("/git/trees") and method == "POST":
+                self.assertEqual(len(blob_threads), 4)
+                return {"sha": "tree"}
+            if path.endswith("/git/commits") and method == "POST":
+                return {"sha": "commit"}
+            if path.endswith("/git/refs/heads/main") and method == "PATCH":
+                return {"object": {"sha": "commit"}}
+            raise AssertionError((path, method, body))
+
+        with mock.patch.object(bc, "api", side_effect=fake_api), \
+             mock.patch.object(pio, "_set_recovery_ref"), \
+             mock.patch.object(pio, "_clear_recovery_ref"):
+            commit = bc.put_create_only("owner/private", files, "parallel fixture")
+
+        self.assertEqual(commit, "commit")
+        self.assertEqual(len(blob_threads), 4)
+        first_tree = next(i for i, item in enumerate(calls)
+                          if item[0].endswith("/git/trees") and item[1] == "POST")
+        blob_indices = [i for i, item in enumerate(calls)
+                        if item[0].endswith("/git/blobs") and item[1] == "POST"]
+        self.assertTrue(blob_indices)
+        self.assertLess(max(blob_indices), first_tree)
+
+    def test_parallel_blob_retry_reuses_successful_uploads(self):
+        files = {"transport/x/a.txt": b"a", "transport/x/b.txt": b"b"}
+        failure = urllib.error.HTTPError("u", 503, "retry", {}, None)
+        lock = threading.Lock()
+        attempts = {"a": 0, "b": 0}
+
+        def fake_api(path, method="GET", body=None):
+            if path.endswith("/git/ref/heads/main") and method == "GET":
+                return {"object": {"sha": "parent"}}
+            if path.endswith("/git/commits/parent") and method == "GET":
+                return {"tree": {"sha": "base"}}
+            if path.endswith("/git/trees/base?recursive=1") and method == "GET":
+                return {"truncated": False, "tree": []}
+            if path.endswith("/git/blobs") and method == "POST":
+                raw = base64.b64decode(body["content"])
+                key = raw.decode()
+                with lock:
+                    attempts[key] += 1
+                    n = attempts[key]
+                if key == "b" and n == 1:
+                    raise failure
+                return {"sha": pio.blob_sha(raw)}
+            if path.endswith("/git/trees") and method == "POST":
+                return {"sha": "tree"}
+            if path.endswith("/git/commits") and method == "POST":
+                return {"sha": "commit"}
+            if path.endswith("/git/refs/heads/main") and method == "PATCH":
+                return {"object": {"sha": "commit"}}
+            raise AssertionError((path, method, body))
+
+        with mock.patch.object(bc, "api", side_effect=fake_api), \
+             mock.patch.object(bc.time, "sleep"), \
+             mock.patch.object(pio, "_set_recovery_ref"), \
+             mock.patch.object(pio, "_clear_recovery_ref"):
+            self.assertEqual(
+                bc.put_create_only("owner/private", files, "retry fixture"),
+                "commit",
+            )
+
+        self.assertEqual(attempts["a"], 1)
+        self.assertEqual(attempts["b"], 2)
     def test_recovery_ref_precedes_main_and_generic_422_does_not_retry(self):
         missing=urllib.error.HTTPError('u',404,'missing',{},None);calls=[]
         def api(path,method='GET',body=None):
             calls.append((path,method))
             if path.endswith('/git/ref/heads/main'):return {'object':{'sha':'parent'}}
-            if path.endswith('/git/blobs'):return {'sha':'blob'}
+            if path.endswith('/git/blobs'):return {'sha':pio.blob_sha(b'fixture')}
             if path.endswith('/git/commits/parent'):return {'tree':{'sha':'base'}}
             if path.endswith('/git/trees/base?recursive=1'):return {'truncated':False,'tree':[]}
             if path.endswith('/git/trees'):return {'sha':'tree'}
