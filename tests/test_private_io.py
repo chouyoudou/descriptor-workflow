@@ -437,13 +437,47 @@ class BundleRecoveryTests(unittest.TestCase):
         with mock.patch.object(bc,'content',return_value=metadata), \
              mock.patch.object(bc,'api',return_value=response) as get:
             self.assertEqual(bc.read_pinned_file('owner/private','transport/executions/old/result.jsonl',
-                                               'f'*40,blob,bc.MAX_INPUT_FILE),raw)
+                                               'f'*40,blob),raw)
             self.assertEqual(get.call_args.args[0],'/repos/owner/private/git/blobs/'+blob)
         with mock.patch.object(bc,'content',return_value={**metadata,'sha':'0'*40}), \
              mock.patch.object(bc,'api') as get:
             with self.assertRaisesRegex(bc.BundleError,'pinned_file_identity_mismatch'):
-                bc.read_pinned_file('owner/private','inputs/x','f'*40,blob,bc.MAX_INPUT_FILE)
+                bc.read_pinned_file('owner/private','inputs/x','f'*40,blob)
             get.assert_not_called()
+
+    def test_bundle_publisher_accepts_task_defined_regular_outputs_and_no_focused_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp)
+            _write_success_metadata(out, rows=1)
+            (out/'result.jsonl').write_text('{"id":"a"}\n')
+            (out/'timings.json').write_text('{"stage_seconds":0.25}\n')
+            (out/'diagnostics.txt').write_text('useful task-local evidence\n')
+            captured={}
+            def put(repo,files,message,recovery_ref=None):
+                captured.update(files); return 'c'*40
+            with mock.patch.object(bc,'put_create_only',side_effect=put), \
+                 mock.patch.dict(bc.os.environ,{'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}):
+                bc.publish('owner/private','bt-fixture','b'*40,'a'*40,out)
+            prefix='transport/bundle-executions/bt-fixture/123-1/'
+            self.assertIn(prefix+'timings.json',captured)
+            self.assertIn(prefix+'diagnostics.txt',captured)
+            receipt=json.loads(captured[prefix+'receipt.json'])
+            self.assertEqual(receipt['status'],'materialized')
+            self.assertNotIn('missing_focused_log',receipt['metadata_errors'])
+
+    def test_legacy_publisher_accepts_task_defined_regular_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); out=root/'out'; out.mkdir()
+            state=_state(root)
+            _write_success_metadata(out, rows=1)
+            (out/'result.jsonl').write_text('{"id":"a"}\n')
+            (out/'timings.json').write_text('{"seconds":0.1}\n')
+            captured={}
+            def put(repo,files,recovery_branch=None):
+                captured.update(files)
+            with mock.patch.object(pio,'put_files',side_effect=put):
+                pio.publish(state,out)
+            self.assertIn('transport/executions/test-request/12345-1/timings.json',captured)
 
     def test_already_completed_bundle_skips_without_new_git_write(self):
         code='print(1)\n';bundle={'schema':bc.SCHEMA,'bundle_id':'bt-fixture',
