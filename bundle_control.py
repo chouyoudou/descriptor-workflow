@@ -384,20 +384,31 @@ def put_create_only(repo, files, message, recovery_ref=None, known_blob_shas=Non
         safe_path(path)
         if not isinstance(raw, (bytes, bytearray)):
             raise BundleError("invalid_file_bytes")
+    from git_publication_snapshot import existing_blob_snapshot, TreeSnapshotError
     for attempt in range(7):
         updating_ref = False
         try:
             parent = api(f"/repos/{repo}/git/ref/heads/main")["object"]["sha"]
+            try:
+                tree, existing = existing_blob_snapshot(api, repo, parent, files)
+            except TreeSnapshotError as exc:
+                raise BundleError(str(exc)) from exc
             entries = []
             for path, raw in files.items():
-                try:
-                    old = content(repo, path, parent)
-                except urllib.error.HTTPError as exc:
-                    if exc.code != 404:
-                        raise
+                expected = hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest()
+                if existing is None:
+                    try:
+                        old = content(repo, path, parent)
+                    except urllib.error.HTTPError as exc:
+                        if exc.code != 404:
+                            raise
+                        old_sha = None
+                    else:
+                        old_sha = old.get("sha")
                 else:
-                    expected = hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest()
-                    if old.get("sha") == expected:
+                    old_sha = existing[path]
+                if old_sha is not None:
+                    if old_sha == expected:
                         continue
                     raise BundleError("refuse_different_existing_file:" + path)
                 if path not in blob_shas:
@@ -413,7 +424,6 @@ def put_create_only(repo, files, message, recovery_ref=None, known_blob_shas=Non
                 if recovery_ref:
                     _clear_recovery_ref(repo, recovery_ref)
                 return parent
-            tree = api(f"/repos/{repo}/git/commits/{parent}")["tree"]["sha"]
             new_tree = api(f"/repos/{repo}/git/trees", "POST",
                            {"base_tree": tree, "tree": entries})["sha"]
             commit = api(
