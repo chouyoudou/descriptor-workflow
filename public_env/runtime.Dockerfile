@@ -11,11 +11,11 @@ LABEL org.opencontainers.image.source="https://github.com/chouyoudou/descriptor-
 RUN apt-get update \
     && apt-get install -y --no-install-recommends g++ make \
     && rm -rf /var/lib/apt/lists/*
-COPY wheelhouse /wheelhouse
 COPY resolved.lock /tmp/resolved.lock
-RUN python3 -m pip install --no-index --find-links=/wheelhouse \
-      -r /tmp/resolved.lock --quiet \
-    && rm -rf /wheelhouse /root/.cache/pip
+# Wheels are build inputs, not runtime files. A later rm cannot remove a COPY layer.
+RUN --mount=type=bind,source=wheelhouse,target=/wheelhouse,readonly \
+    python3 -m pip install --no-cache-dir --no-index --find-links=/wheelhouse \
+      -r /tmp/resolved.lock --quiet
 
 # Public native dependency only; private tasks and data never enter this layer.
 RUN python3 - <<'PY'
