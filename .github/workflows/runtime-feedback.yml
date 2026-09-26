@@ -1,12 +1,7 @@
+# Optional reproduction of the 2026-09-26 startup experiment, not a research prerequisite.
+# The historical baseline cache must exist. A missing baseline is not a candidate failure.
 name: Public runtime startup comparison
 on:
-  pull_request:
-    paths:
-      - "public_env/runtime_cache.py"
-      - "public_env/runtime.Dockerfile"
-      - "tests/test_runtime_verification.py"
-      - "tests/benchmark_runtime_startup.py"
-      - ".github/workflows/runtime-feedback.yml"
   workflow_dispatch:
 permissions:
   contents: read
@@ -22,7 +17,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 0
       - name: Unit checks and immutable baseline
         run: |
           python3 -m unittest discover -s tests -v
