@@ -44,9 +44,6 @@ def missing():
 class Control:
     """Mock transport only; actual candidate arithmetic is run in one test."""
     FILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
-    MAX_INPUT_FILES = 16
-    MAX_INPUT_FILE = 32 * 1024 * 1024
-    MAX_INPUT_TOTAL = 96 * 1024 * 1024
     ALLOWED_INPUT_PREFIXES = ("inputs/", "transport/tasks/")
 
     def __init__(self, request=None):
@@ -103,7 +100,7 @@ class Control:
             raise ValueError("blob_identity_mismatch")
         return raw
 
-    def read_pinned_file(self, repo, path, ref, expected_blob, limit):
+    def read_pinned_file(self, repo, path, ref, expected_blob):
         self.calls.append(("input", path, ref, expected_blob))
         if self.bad_input or expected_blob != blob(self.input_data):
             raise ValueError("pinned_file_identity_mismatch")
@@ -135,6 +132,13 @@ class RunRequestTests(unittest.TestCase):
 
     def fetch(self, c, target):
         return ingress.fetch_task("owner/private", BUNDLE, REF, c.blob, target, c)
+
+    def test_many_inputs_are_not_rejected_by_a_project_count_quota(self):
+        inputs = {f"input_{i}.json": self.spec() for i in range(40)}
+        c = Control(self.request(inputs=inputs))
+        got = ingress.materialize_outputs(c, "owner/private", BUNDLE)
+        self.assertEqual(got["source_ref"], REF)
+        self.assertEqual(len(ingress.validate_run_request(c, c.request, BUNDLE)[1]), 40)
 
     def test_no_edit_fields_required_and_no_source_write(self):
         c = Control()
