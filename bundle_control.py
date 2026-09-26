@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from bundle_read_retry import retry_read
 
 BUNDLE_RE = re.compile(r"^bt-[A-Za-z0-9_.-]{1,64}$")
 FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
@@ -113,6 +114,7 @@ def decode_contents(item, limit=None):
         raise BundleError("blob_identity_mismatch")
     return raw
 
+@retry_read
 def read_repository_file(repo, path, ref, limit=None, expected_blob=None):
     """Read a GitHub file by immutable identity, falling back to the Git blob body."""
     item = content(repo, path, ref)
