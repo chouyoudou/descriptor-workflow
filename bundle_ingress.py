@@ -74,7 +74,47 @@ def resolve(event_path):
     return result
 
 
-def validate_run_request(control, request, bundle_id):
+def resolve_run_inputs(control, repo, request):
+    """Reuse a saved request's input bindings; newer explicit entries win.
+
+    inputs_from is the existing bundle_blob in a prior receipt. Only inputs
+    are inherited, never source, config, budget or execution state. Resolution
+    reads immutable request objects and writes nothing.
+    """
+    if "inputs_from" not in request:
+        return request.get("inputs", {})
+    layers, seen = [], set()
+    current = request
+    while True:
+        inputs = current.get("inputs", {})
+        if not isinstance(inputs, dict):
+            raise ValueError("invalid_inputs")
+        layers.append(inputs)
+        if current.get("schema") != RUN_SCHEMA or "inputs_from" not in current:
+            break
+        parent = current["inputs_from"]
+        if not isinstance(parent, str) or not REF_RE.fullmatch(parent):
+            raise ValueError("invalid_inputs_from")
+        if parent in seen:
+            raise ValueError("cyclic_inputs_from")
+        seen.add(parent)
+        if repo is None:
+            raise ValueError("inputs_from_requires_repository")
+        item = control.api(f"/repos/{repo}/git/blobs/{parent}", max_response_bytes=None)
+        if item.get("sha") != parent:
+            raise ValueError("request_blob_identity_mismatch")
+        current = json.loads(control.decode_contents({**item, "type": "file"}))
+        if (not isinstance(current, dict) or current.get("schema") not in
+                (RUN_SCHEMA, "private-task-bundle/2", "private-task-bundle/3",
+                 "private-task-bundle/4")):
+            raise ValueError("inputs_from_not_a_request")
+    merged = {}
+    for inputs in reversed(layers):
+        merged.update(inputs)
+    return merged
+
+
+def validate_run_request(control, request, bundle_id, repo=None):
     """Validate a run, not a source edit. Config is plain JSON, never evaluated."""
     if (not isinstance(request, dict) or request.get("schema") != RUN_SCHEMA
             or request.get("bundle_id") != bundle_id):
@@ -84,7 +124,7 @@ def validate_run_request(control, request, bundle_id):
         raise ValueError("invalid_run_source_ref")
     if {"files", "changed_files", "delete_files", "sha256", "base_source_ref"} & request.keys():
         raise ValueError("run_request_cannot_edit_source")
-    inputs = request.get("inputs", {})
+    inputs = resolve_run_inputs(control, repo, request)
     if not isinstance(inputs, dict):
         raise ValueError("invalid_inputs")
     normalized = {}
@@ -122,7 +162,7 @@ def check_run_names(base, inputs, config):
 
 def run_outputs(control, repo, bundle_id, request, blob):
     """An immutable request reuses source_ref; it never writes source files."""
-    ref, inputs, budget, config = validate_run_request(control, request, bundle_id)
+    ref, inputs, budget, config = validate_run_request(control, request, bundle_id, repo=repo)
     outputs = {"source_ref": ref, "bundle_blob": blob, "timeout_seconds": str(budget),
                "source_mode": "reused", "skip": "false"}
     path = f"transport/bundle-executions/{bundle_id}/completed.json"
@@ -224,7 +264,7 @@ def fetch_task(repo, bundle_id, source_ref, bundle_blob, dest, control=None):
         if json.loads(manifest).get("bundle_blob") != bundle_blob:
             raise ValueError("source_request_identity_mismatch")
         return control.fetch_task(repo, bundle_id, source_ref, dest)
-    ref, inputs, _, config = validate_run_request(control, request, bundle_id)
+    ref, inputs, _, config = validate_run_request(control, request, bundle_id, repo=repo)
     if ref != source_ref:
         raise ValueError("run_source_identity_mismatch")
     base = control._load_base_source(repo, ref)
