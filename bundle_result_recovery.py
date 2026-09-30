@@ -130,24 +130,22 @@ def verify_snapshot(control, repo, bundle_id, bundle_blob, request, snapshot, pr
     if entries.get("receipt.json", {}).get("mode") != "100644":
         raise ValueError("nonregular_snapshot_receipt")
     collect(receipt_path)
-    summary_raw = files.get(prefix + "/summary.json")
-    execution_raw = files.get(prefix + "/execution.json")
-    try:
-        summary = load(summary_raw) if summary_raw is not None else {}
-        execution = load(execution_raw) if execution_raw is not None else {}
-    except (ValueError, TypeError, UnicodeError):
-        if receipt["status"] == "materialized":
-            raise ValueError("invalid_success_metadata")
-        summary, execution = {}, {}
-    with tempfile.TemporaryDirectory(prefix="result-check-") as tmp:
-        path = Path(tmp) / "result.jsonl"
-        if prefix + "/result.jsonl" in files:
-            path.write_bytes(files[prefix + "/result.jsonl"])
-        validation = inspector(path, summary.get("rows"))
-    if (validation != receipt.get("result_validation")
-            or validation.get("records", 0) != receipt.get("result_rows")):
-        raise ValueError("saved_result_validation_mismatch")
     if receipt["status"] == "materialized":
+        summary_raw = files.get(prefix + "/summary.json")
+        execution_raw = files.get(prefix + "/execution.json")
+        try:
+            summary = load(summary_raw) if summary_raw is not None else {}
+            execution = load(execution_raw) if execution_raw is not None else {}
+        except (ValueError, TypeError, UnicodeError):
+            raise ValueError("invalid_success_metadata")
+        with tempfile.TemporaryDirectory(prefix="result-check-") as tmp:
+            path = Path(tmp) / "result.jsonl"
+            if prefix + "/result.jsonl" in files:
+                path.write_bytes(files[prefix + "/result.jsonl"])
+            validation = inspector(path, summary.get("rows"))
+        if (validation != receipt.get("result_validation")
+                or validation.get("records", 0) != receipt.get("result_rows")):
+            raise ValueError("saved_result_validation_mismatch")
         if not (summary.get("stage") == "materialized"
                 and execution.get("exit_code") == 0
                 and not execution.get("timed_out")

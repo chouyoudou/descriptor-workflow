@@ -9,7 +9,7 @@ permissions:
 
 env:
   PRIVATE_REPOSITORY: chouyoudou/descriptor-workflow-private
-  PUBLIC_LOCK_SHA: 2cd687069fe7283471ff171f26a0e9b745604fef95fbf28cb1c10ce28efa5d11
+  PUBLIC_LOCK_SHA: 6aeaff8f2cca5cd2ae943be3af761a0f1441ee84bd46fc2256a3e956ded5c680
   PYTHON_IMAGE: python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
 
 jobs:
@@ -116,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 public_env/public_deps.py verify-lock \
-            public_env/resolved.lock "$PUBLIC_LOCK_SHA" 50
+            public_env/resolved.lock "$PUBLIC_LOCK_SHA" 51
           mkdir -p .public-wheelhouse
           if [ "${{ steps.wheels_v2.outputs.cache-hit }}" != "true" ] && \
              [ "${{ steps.wheels_v1.outputs.cache-hit }}" != "true" ]; then

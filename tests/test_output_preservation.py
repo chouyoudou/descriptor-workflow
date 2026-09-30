@@ -27,9 +27,11 @@ class PublicationPreservationTests(unittest.TestCase):
             (root / name).write_bytes(data)
         return raw
 
-    def publish(self, root):
+    def publish(self, root, put_error=None):
         captured = {}
         def put(repo, files, message, recovery_ref=None):
+            if put_error:
+                raise bc.BundleError(put_error)
             captured.update(files)
             return "c" * 40
         failure = None
@@ -54,6 +56,9 @@ class PublicationPreservationTests(unittest.TestCase):
                 self.assertEqual(saved[self.prefix + name], raw)
             receipt = json.loads(saved[self.prefix + "receipt.json"])
             self.assertEqual(receipt["status"], "materialized")
+            self.assertEqual(receipt["publication_status"], "published")
+            self.assertEqual(receipt["scientific_completion"], "not_claimed")
+            self.assertEqual(receipt["scientific_review_status"], "pending")
             self.assertIn("transport/bundle-executions/" + self.bundle_id + "/completed.json", saved)
 
     def test_one_bad_entry_does_not_discard_regular_siblings(self):
@@ -81,12 +86,14 @@ class PublicationPreservationTests(unittest.TestCase):
                 else:
                     path.write_bytes(b"not-a-valid-output-entry")
                 saved, failure, calls, logs = self.publish(root)
-                self.assertIsNotNone(failure)
+                self.assertIsNone(failure)
                 self.assertEqual(calls, 1, "Valid siblings must reach the private transaction before failure returns")
                 for filename, raw in original.items():
                     self.assertEqual(saved[self.prefix + filename], raw)
                 receipt = json.loads(saved[self.prefix + "receipt.json"])
                 self.assertEqual(receipt["status"], "failed_or_partial")
+                self.assertEqual(receipt["publication_status"], "published")
+                self.assertEqual(receipt["scientific_completion"], "not_claimed")
                 self.assertTrue(receipt["collection_errors"])
                 self.assertEqual(receipt["result_validation"], {"status": "valid", "records": 1})
                 self.assertNotIn(name, receipt["files"])
@@ -94,8 +101,67 @@ class PublicationPreservationTests(unittest.TestCase):
                 self.assertNotIn("transport/bundle-executions/" + self.bundle_id + "/completed.json", saved)
                 review = json.loads(saved["transport/reviews/pending/" + self.bundle_id + "/123-1.json"])
                 self.assertEqual(review["execution_status"], "failed_or_partial")
+                self.assertEqual(review["next_action"], "independent_review")
+                self.assertEqual(review["scientific_review_status"], "pending")
                 self.assertNotIn(name, logs)
                 self.assertEqual(outside.read_bytes(), b"must-not-be-collected")
+
+    def test_nonstandard_report_is_preserved_for_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "report.txt").write_bytes(b"human-readable report only\n")
+            saved, failure, calls, _ = self.publish(root)
+            self.assertIsNone(failure)
+            self.assertEqual(calls, 1)
+            prefix = self.prefix
+            self.assertEqual(saved[prefix + "report.txt"], b"human-readable report only\n")
+            receipt = json.loads(saved[prefix + "receipt.json"])
+            self.assertEqual(receipt["status"], "failed_or_partial")
+            self.assertEqual(receipt["publication_status"], "published")
+            self.assertEqual(receipt["scientific_completion"], "not_claimed")
+            self.assertNotIn(
+                "transport/bundle-executions/" + self.bundle_id + "/completed.json",
+                saved,
+            )
+            review = json.loads(
+                saved["transport/reviews/pending/" + self.bundle_id + "/123-1.json"]
+            )
+            self.assertEqual(review["next_action"], "independent_review")
+            self.assertEqual(review["scientific_review_status"], "pending")
+
+    def test_execution_failure_and_timeout_are_saved_for_review(self):
+        for name, execution in (
+            ("failure", {"exit_code": 7, "timed_out": False, "output_limit_exceeded": False}),
+            ("timeout", {"exit_code": 0, "timed_out": True, "output_limit_exceeded": False}),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                (root / "execution.json").write_text(
+                    json.dumps(execution) + chr(10), encoding="utf-8"
+                )
+                saved, failure, calls, _ = self.publish(root)
+                self.assertIsNone(failure)
+                self.assertEqual(calls, 1)
+                receipt = json.loads(saved[self.prefix + "receipt.json"])
+                self.assertEqual(receipt["status"], "failed_or_partial")
+                self.assertEqual(receipt["publication_status"], "published")
+                self.assertEqual(receipt["scientific_completion"], "not_claimed")
+                self.assertEqual(receipt["execution_status"], execution)
+                self.assertNotIn(
+                    "transport/bundle-executions/" + self.bundle_id + "/completed.json",
+                    saved,
+                )
+
+    def test_real_private_put_failure_propagates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "report.txt").write_bytes(b"preserve before API failure" + bytes([10]))
+            saved, failure, calls, _ = self.publish(root, put_error="api_failure")
+            self.assertIsNotNone(failure)
+            self.assertIn("api_failure", str(failure))
+            self.assertEqual(calls, 1)
+            self.assertEqual(saved, {})
 
 
 if __name__ == "__main__":

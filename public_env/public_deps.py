@@ -152,6 +152,8 @@ def smoke() -> dict[str, object]:
     import spglib
     from matminer.featurizers.site import CrystalNNFingerprint
     from pymatgen.core import Lattice, Structure
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
 
     fp = CrystalNNFingerprint.from_preset("ops", x_diff_weight=None, distance_cutoffs=None)
     labels = list(fp.feature_labels())
@@ -161,6 +163,31 @@ def smoke() -> dict[str, object]:
     values = np.asarray(fp.featurize(structure, 0), dtype=float)
     if values.shape != (61,) or not np.isfinite(values).all():
         raise SystemExit("public synthetic fingerprint smoke failed")
+    ethanol = Chem.AddHs(Chem.MolFromSmiles("CCO"))
+    if ethanol is None:
+        raise SystemExit("RDKit ethanol parse failed")
+    embed_status = int(AllChem.EmbedMolecule(ethanol, randomSeed=0xF00D, useRandomCoords=False))
+    if embed_status != 0:
+        raise SystemExit("RDKit ethanol embedding failed")
+    force_field = AllChem.UFFGetMoleculeForceField(ethanol)
+    if force_field is None:
+        raise SystemExit("RDKit UFF force field unavailable")
+    initial_energy = float(force_field.CalcEnergy())
+    optimize_status = int(AllChem.UFFOptimizeMolecule(ethanol, maxIters=50))
+    optimized_energy = float(force_field.CalcEnergy())
+    if not np.isfinite([initial_energy, optimized_energy]).all():
+        raise SystemExit("RDKit UFF energy is nonfinite")
+    rdkit_smoke = {
+        "distribution": metadata.version("rdkit"),
+        "smiles": "CCO",
+        "atom_count": int(ethanol.GetNumAtoms()),
+        "embed_status": embed_status,
+        "uff_optimize_status": optimize_status,
+        "initial_energy": initial_energy,
+        "optimized_energy": optimized_energy,
+        "energies_finite": True,
+    }
+
     return {
         "schema": "public-scientific-env-smoke/2",
         "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
@@ -172,6 +199,7 @@ def smoke() -> dict[str, object]:
         "finite_coordinates": int(np.isfinite(values).sum()),
         "synthetic_only": True,
         "native_reference": native_reference_smoke(),
+        "rdkit_smoke": rdkit_smoke,
     }
 
 
