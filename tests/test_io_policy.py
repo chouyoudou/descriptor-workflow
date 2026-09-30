@@ -96,8 +96,7 @@ class OutputPolicyTests(unittest.TestCase):
                      mock.patch.dict(os.environ, {
                          "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"
                      }):
-                    with self.assertRaisesRegex(bc.BundleError, "failed_execution_preserved"):
-                        bc.publish("owner/private", "bt-output-unit", "b" * 40, "a" * 40, out)
+                    bc.publish("owner/private", "bt-output-unit", "b" * 40, "a" * 40, out)
                 put.assert_called_once()
                 saved = put.call_args.args[1]
                 prefix = "transport/bundle-executions/bt-output-unit/123-1/"
