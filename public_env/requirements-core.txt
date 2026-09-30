@@ -12,3 +12,4 @@ pybind11==3.0.1
 ase==3.26.0
 PyYAML==6.0.2
 pyvoro2==0.8.0
+rdkit==2026.3.6

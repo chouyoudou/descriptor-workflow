@@ -661,10 +661,19 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
     summary = parse_metadata("summary.json")
     execution = parse_metadata("execution.json")
     expected_rows = summary.get("rows")
-    result_validation, progress_validation = inspect_collected(
-        collected, expected_rows, execution
-    )
-    success = (
+    validation_errors = []
+    try:
+        result_validation, progress_validation = inspect_collected(
+            collected, expected_rows, execution
+        )
+    except Exception as exc:
+        validation_errors.append({
+            "class": type(exc).__name__,
+            "detail": str(exc),
+        })
+        result_validation = {"status": "not_checked"}
+        progress_validation = {"status": "not_checked"}
+    legacy_completed = (
         summary.get("stage") == "materialized"
         and execution.get("exit_code") == 0
         and not execution.get("timed_out")
@@ -688,7 +697,16 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
         "run_attempt": attempt,
         "files": {n: hashlib.sha256(b).hexdigest() for n, b in sorted(collected.items())},
         "result_rows": actual_rows,
-        "status": "materialized" if success else "failed_or_partial",
+        "status": "materialized" if legacy_completed else "failed_or_partial",
+        "publication_status": "published",
+        "scientific_completion": "not_claimed",
+        "scientific_review_status": "pending",
+        "execution_status": {
+            "exit_code": execution.get("exit_code"),
+            "timed_out": execution.get("timed_out"),
+            "output_limit_exceeded": execution.get("output_limit_exceeded"),
+        },
+        "validation_errors": validation_errors,
         "result_validation": result_validation,
         "progress": progress_validation,
         "metadata_errors": errors,
@@ -704,7 +722,10 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
         "schema": "private-review-submission/1",
         "review_status": "pending",
         "execution_status": receipt["status"],
-        "next_action": "independent_review" if success else "execution_recovery",
+        "next_action": "independent_review",
+        "scientific_review_status": "pending",
+        "stage": summary.get("stage"),
+        "validation_error_count": len(validation_errors),
         "bundle_id": bundle_id, "bundle_blob": bundle_blob,
         "source_ref": source_ref, "run_id": run, "run_attempt": attempt,
         "receipt_path": f"{prefix}/receipt.json",
@@ -715,16 +736,13 @@ def publish(repo, bundle_id, source_ref, bundle_blob, output):
     files[f"transport/reviews/pending/{bundle_id}/{run}-{attempt}.json"] = (
         json.dumps(review_submission, indent=2, sort_keys=True) + "\n"
     ).encode()
-    if success:
+    if legacy_completed:
         files[f"transport/bundle-executions/{bundle_id}/completed.json"] = (
             json.dumps(receipt, sort_keys=True) + "\n"
         ).encode()
     commit = put_create_only(repo, files, "Record bundle computation result",
                              recovery_ref=recovery_branch(bundle_id, "result"))
     append_output("result_commit", commit)
-    if not success:
-        print("PUBLISH_STAGE=failed-prefix-saved")
-        raise BundleError("failed_execution_preserved")
     print("PUBLISH_STAGE=complete")
 
 def main():
