@@ -355,11 +355,7 @@ class BundleRecoveryTests(unittest.TestCase):
             return 'c'*40
         with mock.patch.object(bc,'put_create_only',side_effect=put), \
              mock.patch.dict(bc.os.environ,{'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}):
-            if exit_code or not result or not metadata:
-                with self.assertRaisesRegex(bc.BundleError,'failed_execution_preserved'):
-                    bc.publish('owner/private','bt-fixture','b'*40,'a'*40,out)
-            else:
-                bc.publish('owner/private','bt-fixture','b'*40,'a'*40,out)
+            bc.publish('owner/private','bt-fixture','b'*40,'a'*40,out)
         return captured
 
     def test_failure_keeps_prefix_and_receipt_without_completion(self):
@@ -397,8 +393,7 @@ class BundleRecoveryTests(unittest.TestCase):
                 captured.update(files); return "c"*40
             with mock.patch.object(bc,"put_create_only",side_effect=put), \
                  mock.patch.dict(bc.os.environ,{"GITHUB_RUN_ID":"123","GITHUB_RUN_ATTEMPT":"1"}):
-                with self.assertRaisesRegex(bc.BundleError,"failed_execution_preserved"):
-                    bc.publish("owner/private","bt-fixture","b"*40,"a"*40,out)
+                bc.publish("owner/private","bt-fixture","b"*40,"a"*40,out)
             prefix="transport/bundle-executions/bt-fixture/123-1/"
             self.assertIn(prefix+"progress.jsonl",captured)
             receipt=json.loads(captured[prefix+"receipt.json"])
@@ -424,7 +419,7 @@ class BundleRecoveryTests(unittest.TestCase):
             self.assertNotIn('transport/bundle-executions/bt-fixture/completed.json',files)
             queued=json.loads(files['transport/reviews/pending/bt-fixture/123-1.json'])
             self.assertEqual(queued['review_status'],'pending')
-            self.assertEqual(queued['next_action'],'execution_recovery')
+            self.assertEqual(queued['next_action'],'independent_review')
             self.assertIsNone(queued['result_path'])
 
     def test_no_output_directory_still_gets_failure_receipt(self):

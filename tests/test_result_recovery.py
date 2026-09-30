@@ -172,6 +172,21 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.resume(c)['state'], 'already_published_partial')
         self.assertEqual(c.commit_count, 1)
 
+    def test_partial_recovery_does_not_require_report_or_result_files(self):
+        files = fixture(False)
+        receipt_path = PREFIX + '/receipt.json'
+        receipt = json.loads(files[receipt_path])
+        for name in ('summary.json', 'result.jsonl'):
+            receipt['files'].pop(name)
+            files.pop(PREFIX + '/' + name)
+        files[receipt_path] = encoded(receipt)
+        c = FakeGit(files)
+        result = self.resume(c)
+        self.assertEqual(result['state'], 'publication_recovered')
+        self.assertEqual(result['receipt']['status'], 'failed_or_partial')
+        self.assertNotIn(ROOT + '/completed.json', c.versions[c.main])
+        self.assertEqual(c.commit_count, 1)
+
     def test_replayed_success_does_not_republish_result_bytes(self):
         c = FakeGit()
         self.resume(c)

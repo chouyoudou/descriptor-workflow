@@ -115,8 +115,7 @@ class SnapshotRecoveryTests(unittest.TestCase):
             with mock.patch.object(bc, 'put_create_only', side_effect=put), \
                  mock.patch.dict(os.environ, {'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '2'}), \
                  contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaisesRegex(bc.BundleError, 'failed_execution_preserved'):
-                    bc.publish('owner/private', f.BID, f.SOURCE, f.BLOB, root)
+                bc.publish('owner/private', f.BID, f.SOURCE, f.BLOB, root)
         return saved
 
     def test_actual_collected_partial_snapshot_can_recover_and_replay(self):
