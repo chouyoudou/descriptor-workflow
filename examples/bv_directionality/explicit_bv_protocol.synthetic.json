@@ -1,0 +1,21 @@
+{
+  "schema": "explicit-bond-valence-protocol/1",
+  "site_oxidation_states": [2, -1, -1, -1, -1, -1, -1],
+  "candidate_site_indices": [0],
+  "minimum_bond_valence": 0.0001,
+  "maximum_distance_angstrom": 5.0,
+  "vector_cutoff": 0.5,
+  "dummy_offset_angstrom": 1.0,
+  "note": "Demonstration only. R0=2.0 A is a synthetic value, not a published Sn(II)-F parameter.",
+  "pair_parameters": [
+    {
+      "cation": "Sn",
+      "cation_oxidation": 2,
+      "anion": "F",
+      "anion_oxidation": -1,
+      "r0_angstrom": 2.0,
+      "b_angstrom": 0.37,
+      "source": "synthetic example parameter; replace with a cited parameter set before scientific use"
+    }
+  ]
+}

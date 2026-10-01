@@ -48,15 +48,22 @@ orthorhombic and skew cells.
 | Component | Purpose |
 | --- | --- |
 | [`crystal_geometry.py`](crystal_geometry.py) | Cell volume and volume per atom. |
+| [`descriptors/bv_directionality.py`](descriptors/bv_directionality.py) | Radius-contact directional imbalance for ordinary POSCAR files, plus an opt-in explicit-parameter local BVS/BVSM/vector layer. |
 | [`restricted_exec.py`](restricted_exec.py) | Subprocess time limits and bounded output capture. |
 | [`public_env/`](public_env/) | Pinned dependencies and reusable Docker runtime caching. |
 | [`request_contract.py`](request_contract.py) | Validation of job requests and execution slots. |
 | [`private_io.py`](private_io.py) | Optional authenticated repository I/O for separately managed job inputs and results. |
 | [`bundle_control.py`](bundle_control.py) | Immutable source-bundle materialization and result publication. |
 
+The bond-valence directionality implementation keeps its default geometric
+radius-contact layer separate from the oxidation-state- and parameter-specific
+bond-valence layer. It does not calculate a BVSE field, migration barrier,
+electron density, lone-pair density, carrier concentration, or conductivity.
+See the [method and provenance notes](examples/bv_directionality/README.md).
+
 The Actions workflows cover public tests, runtime preparation, and configured
 integration jobs. Docker is required for container-based execution; the
-standalone geometry example does not need it.
+standalone geometry and descriptor examples do not need it.
 
 The integration bridge accepts both pre-hashed `private-task-bundle/2` requests
 and text-first `private-task-bundle/3` requests. For text-first requests, the

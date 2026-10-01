@@ -1,0 +1,84 @@
+name: Bond-valence directionality qualification
+
+on:
+  push:
+    paths:
+      - "descriptors/bv_directionality*.py"
+      - "descriptors/__init__.py"
+      - "tests/test_bv_directionality.py"
+      - "examples/bv_directionality/**"
+      - ".github/workflows/bv-directionality.yml"
+  pull_request:
+    paths:
+      - "descriptors/bv_directionality*.py"
+      - "descriptors/__init__.py"
+      - "tests/test_bv_directionality.py"
+      - "examples/bv_directionality/**"
+      - ".github/workflows/bv-directionality.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-thousand:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Unit and invariance tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Fixed-seed 1,000-structure qualification
+        run: |
+          set -euo pipefail
+          rm -rf out/bv-directionality-1000
+          python3 descriptors/bv_directionality.py benchmark \
+            --count-per-family 200 \
+            --seed 20251001 \
+            --output-dir out/bv-directionality-1000 \
+            > out/bv-directionality-1000-console-summary.json
+
+      - name: Verify qualification contract
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          summary = json.loads(Path("out/bv-directionality-1000-console-summary.json").read_text())
+          assert summary["expected_structure_count"] == 1000, summary
+          assert summary["successful_structure_count"] == 1000, summary
+          assert summary["failure_count"] == 0, summary
+          assert summary["finite_row_count"] == 1000, summary
+          assert summary["fallback_row_count"] == 0, summary
+          assert summary["negative_virtual_clearance_count"] == 0, summary
+          assert len(summary["row_sha256"]) == 64
+          assert set(summary["family_summaries"]) == {
+              "octahedral", "tetrahedral", "cubic", "hexagonal_planar", "square_planar"
+          }
+          for family, row in summary["family_summaries"].items():
+              assert row["count"] == 200, (family, row)
+              assert row["severity_imbalance_pearson"] > 0.75, (family, row)
+          print("QUALIFICATION_STAGE=1000-complete")
+          print("ROW_SHA256=" + summary["row_sha256"])
+          PY
+          cat out/bv-directionality-1000/thousand-run-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: "bv-directionality-1000-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: |
+            out/bv-directionality-1000-console-summary.json
+            out/bv-directionality-1000/thousand-run-results.json
+            out/bv-directionality-1000/thousand-run-failures.csv
+            out/bv-directionality-1000/thousand-run-sample-map.csv
+            out/bv-directionality-1000/thousand-run-summary.md
+            out/bv-directionality-1000/thousand-run-analysis.md
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: false
