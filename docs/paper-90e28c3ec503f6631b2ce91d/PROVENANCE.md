@@ -63,21 +63,23 @@ than treated as established physical observables.
 - Private materialized output:
   `transport/bundle-executions/bt-paper-90e28c3ec503f6631b2ce91d-v1/37014829265-1/`
 - Frozen input: 1000 structures, target properties not read
-- Runtime: Python 3.11.14, NumPy 2.4.3, pymatgen 2026.3.9, four workers
-- Wall time: 118.655 s
+- Materialized input SHA-256:
+  `98ed32e4c0a62ea718bf884be8dbd8937bdd87ca23c00ce11c2b3b8506418406`
+- Runtime: Python 3.12.14, NumPy 2.5.3, pymatgen 2026.5.4, four workers
+- Wall time: 1.851472917 s
 - Row status: 1000 `ok`, zero failed/unavailable rows
 - Result SHA-256:
-  `f60c2ae9dbf73941f34f66a2b49ef61c621805117993459a087bb8e8fbd1ffb`
-- Invariance/synthetic diagnostics: passed; maximum absolute discrepancy
-  `6.286637876939949e-15`
+  `aa97f4bd0f9e5287634191ab235bf1193ecddd9f8386f0aff8a2c9458f2909cf`
+- Invariance/synthetic diagnostics: passed at tolerance `2e-8`; maximum absolute
+  discrepancy `6.180766216856824e-11`
 
 Coverage of typed feature values:
 
 - 20 of 23 features were defined for all 1000 structures.
-- `first_shell_offcentering_alignment`: 971 defined; 29 typed nulls because all
+- `first_shell_offcentering_alignment`: 945 defined; 55 typed nulls because all
   local off-centering vectors had zero norm.
 - `atomic_number_contrast_fabric_q2` and
-  `atomic_number_contrast_q2_shift`: 815 defined each; 185 typed nulls because
+  `atomic_number_contrast_q2_shift`: 889 defined each; 111 typed nulls because
   every selected pair had zero atomic-number contrast.
 
 Synthetic reference checks recovered exact ideal limits for a two-direction
@@ -96,9 +98,10 @@ Formal private source snapshot:
   `a2c7c565e2c67aebedcf05aa5ae9ba5282cf3e91`
 - frozen input blob: `b031d4c8621a7591b301113d28b369a953f845ef`
 - runtime science-source SHA-256:
-  `83e2ea617441171216dfa2af03f23b2229ee1754a928e8c44e48c0573900db5c`
+  `e0440921be41c774abd95ca7a7ce91d8c0dfccf8efb5d3dcc9f2414213523387`
+- runtime runner SHA-256:
+  `27e7115e9c392eebbec3e2776b6433e5829f7cf61e97c1f464e6905c52743b2c`
 
-The public module is the same scientific implementation as the formal private
-science source. The private runner and raw 1000-row results remain outside the
-public branch so Main can independently inspect and validate the delivered
-record.
+The public module is byte-identical to the formal private science source. The
+private runner and raw 1000-row results remain outside the public branch so Main
+can independently inspect and validate the delivered record.
