@@ -90,7 +90,7 @@ integer normal `h = (h,k,l)`.  With row lattice matrix `A`, the crystallographic
 normal repeat is
 
 ```text
-d_hkl = 1 / || A^(-T) h ||.
+d_hkl = 1 / || A^(-1) h ||.
 ```
 
 Every atom in the supplied cell is projected onto the resulting circle of
