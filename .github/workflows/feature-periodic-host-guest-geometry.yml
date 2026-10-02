@@ -1,0 +1,108 @@
+name: Feature - periodic host guest geometry
+
+on:
+  pull_request:
+    paths:
+      - "descriptors/**"
+      - "docs/periodic_host_guest_geometry_provenance.md"
+      - "examples/POSCAR_phgg_host_guest"
+      - "scripts/qualify_periodic_host_guest_geometry.py"
+      - "tests/features/**"
+      - ".github/workflows/feature-periodic-host-guest-geometry.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  feature-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Unit, invariance, boundary, and CLI tests
+        run: python3 -m unittest -v tests.features.test_periodic_host_guest_geometry
+      - name: Example POSCAR smoke test
+        run: |
+          python3 -m descriptors.periodic_host_guest_geometry \
+            --poscar examples/POSCAR_phgg_host_guest \
+            --params '{"max_grid_points":64}' > /tmp/phgg-example.json
+          python3 - <<'PY'
+          import json
+          payload = json.load(open("/tmp/phgg-example.json", encoding="utf-8"))
+          assert payload["metadata"]["feature_id"] == "periodic-host-guest-geometry/1"
+          assert len(payload["features"]) == 18
+          assert payload["features"]["host_network_dimensionality"] == 3.0
+          assert payload["features"]["host_guest_present_ratio"] == 1.0
+          PY
+
+  qualification-1000:
+    needs: feature-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Run deterministic 1000-structure qualification
+        env:
+          PYTHONPATH: .
+        run: |
+          python3 scripts/qualify_periodic_host_guest_geometry.py \
+            --samples 1000 \
+            --seed 721234 \
+            --out artifacts/periodic-host-guest-geometry-1000
+      - name: Validate artifact contract
+        run: |
+          python3 - <<'PY'
+          import csv
+          import json
+          import math
+          from pathlib import Path
+
+          root = Path("artifacts/periodic-host-guest-geometry-1000")
+          csv_files = list(root.rglob("*.csv"))
+          assert csv_files == [root / "samples.csv"], csv_files
+          summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          assert summary["sample_target"] == 1000
+          assert summary["sample_success"] == 1000
+          assert summary["sample_fail"] == 0
+          assert manifest["sample_target"] == 1000
+          assert manifest["sample_success"] == 1000
+          assert manifest["sample_fail"] == 0
+          assert manifest["feature_id"] == "periodic-host-guest-geometry/1"
+          with (root / "samples.csv").open(newline="", encoding="utf-8") as handle:
+              reader = csv.DictReader(handle)
+              rows = list(reader)
+          assert len(rows) == 1000
+          required = {
+              "sample_id", "n_atoms", "value", "is_finite", "valid",
+              "runtime_ms", "error", "failure_code",
+          }
+          assert required <= set(reader.fieldnames or [])
+          fixed = manifest["fixed_columns"]
+          assert len(fixed) == 18
+          assert set(fixed) <= set(reader.fieldnames or [])
+          for row in rows:
+              assert row["is_finite"] == "True"
+              assert row["valid"] == "True"
+              assert row["error"] == ""
+              assert row["failure_code"] == ""
+              assert math.isfinite(float(row["runtime_ms"]))
+              for name in fixed:
+                  assert math.isfinite(float(row[name]))
+          expected_top = {"README.txt", "evidence", "manifest.json", "samples.csv", "summary.json"}
+          assert {path.name for path in root.iterdir()} == expected_top
+          print("PHGG_ARTIFACT_CONTRACT=ok rows=1000 features=18 failures=0")
+          PY
+      - name: Upload one qualification artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: periodic-host-guest-geometry-1000
+          path: artifacts/periodic-host-guest-geometry-1000
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
