@@ -1,0 +1,46 @@
+{
+  "descriptor_names": [
+    "spacer_path_extension",
+    "spacer_atom_fraction",
+    "component_shape_anisotropy",
+    "coordination_shell_radial_distortion",
+    "coordination_shell_orientation_anisotropy",
+    "interfragment_contact_compactness",
+    "interfragment_contact_coordination",
+    "interfragment_contact_anisotropy",
+    "heteroelement_contact_fraction",
+    "contact_pair_specificity"
+  ],
+  "failure_examples": [],
+  "invariance_checks": {
+    "2x1x1_supercell": 50,
+    "translation_and_species_order": 1000
+  },
+  "mechanism_checks": {
+    "closer_contact_more_compact": true,
+    "distortion_increases_radial_cv": true,
+    "linear_contacts_more_anisotropic": true,
+    "straight_component_more_rodlike": true,
+    "straight_spacer_more_extended": true
+  },
+  "n_fail": 0,
+  "n_pass": 1000,
+  "n_skipped": 0,
+  "n_total": 1000,
+  "pass_rate": 1.0,
+  "row_sha256": "fac474a18f413107304d26a7afeefe3ab847972149697ce9219e552f92845d6b",
+  "scenario_counts": {
+    "chain": 200,
+    "coordination": 200,
+    "fallback": 200,
+    "mixed": 200,
+    "packing": 200
+  },
+  "schema": "descriptor-thousand-example-validation/v1",
+  "seed": 20261002,
+  "software_versions": {
+    "numpy": "2.3.5",
+    "python": "3.13.5"
+  },
+  "task_id": "paper-03aef80c9d0a380d998e06d1"
+}

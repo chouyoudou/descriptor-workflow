@@ -1,0 +1,26 @@
+{
+  "descriptor": "interfragment_contact_anisotropy",
+  "diagnostics": {
+    "n_atoms": 11,
+    "n_bonds": 9,
+    "n_components": 2,
+    "n_contacts": 1,
+    "n_periodic_components": 0
+  },
+  "input": "examples/paper-03aef80c9d0a380d998e06d1/POSCAR",
+  "interpretation_scope": "static geometry and element-radius lookup only; not charge, oxidation state, magnetism, liquid behavior, solubility, thermal stability, or processing history",
+  "parameters": {
+    "bond_scale": 1.18,
+    "contact_ratio_full": 0.75,
+    "contact_ratio_max": 1.05,
+    "contact_ratio_min": 0.45,
+    "max_image_repetitions": 8,
+    "max_unique_pairs": 2000000,
+    "min_spacer_bonds": 3
+  },
+  "schema": "molecular-packing-descriptor/result-v1",
+  "task_id": "paper-03aef80c9d0a380d998e06d1",
+  "units": "dimensionless",
+  "value": 1.0,
+  "version": "1.0.0"
+}

@@ -1,0 +1,16 @@
+{
+  "input": "examples/paper-03aef80c9d0a380d998e06d1/POSCAR",
+  "task_id": "paper-03aef80c9d0a380d998e06d1",
+  "values": {
+    "component_shape_anisotropy": 0.5245479948629233,
+    "contact_pair_specificity": 1.0,
+    "coordination_shell_orientation_anisotropy": 3.693706671735236e-23,
+    "coordination_shell_radial_distortion": 0.013158322809786105,
+    "heteroelement_contact_fraction": 1.0,
+    "interfragment_contact_anisotropy": 1.0,
+    "interfragment_contact_compactness": 0.7857142857142861,
+    "interfragment_contact_coordination": 1.0,
+    "spacer_atom_fraction": 0.36363636363636365,
+    "spacer_path_extension": 0.9572382106388811
+  }
+}
