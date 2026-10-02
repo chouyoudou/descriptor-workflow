@@ -1,5 +1,5 @@
-name: bootstrap paper-5a4d4d payload v2
-run-name: "bootstrap-v2 paper-5a4d4d2640ecebb85628abb0 @ ${{ github.sha }}"
+name: bootstrap paper-5a4d4d payload v3
+run-name: "bootstrap-v3 paper-5a4d4d2640ecebb85628abb0 @ ${{ github.sha }}"
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
           ref: ${{ github.ref_name }}
           fetch-depth: 0
 
-      - name: Extract verified payload from transport file
+      - name: Extract and publish verified non-workflow payload
         shell: bash
         run: |
           set -euo pipefail
@@ -36,8 +36,7 @@ jobs:
           marker = "<<'PAYLOAD'\n"
           start = text.index(marker) + len(marker)
           end = text.index("\nPAYLOAD\n", start)
-          payload = text[start:end].strip() + "\n"
-          Path(os.environ["PAYLOAD_B64"]).write_text(payload, encoding="ascii")
+          Path(os.environ["PAYLOAD_B64"]).write_text(text[start:end].strip() + "\n", encoding="ascii")
           PY
           base64 --decode "$payload_b64" > "$payload_tar"
           echo "efeaa15a2b66f15f496f069a1ff8c1f18824433ded690bfba40d7b2035737711  $payload_tar" | sha256sum -c -
@@ -47,10 +46,18 @@ jobs:
             exit 1
           fi
           tar -xJf "$payload_tar" -C "$GITHUB_WORKSPACE"
-          rm -f "$source_file" .github/workflows/bootstrap-paper-5a4d4d-v2.yml
+          rm -f .github/workflows/impl-paper-5a4d4d2640ecebb85628abb0.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add -- \
+            LICENSE-paper-5a4d4d2640ecebb85628abb0.txt \
+            LICENSES/RDKit-BSD-3-Clause.txt \
+            THIRD_PARTY-paper-5a4d4d2640ecebb85628abb0.md \
+            docs/paper-5a4d4d2640ecebb85628abb0 \
+            phosphate_framework_descriptor \
+            requirements-paper-5a4d4d2640ecebb85628abb0.txt \
+            scripts/run_phosphate_framework_smoke.py \
+            tests/test_phosphate_framework_descriptor.py
           git diff --cached --check
-          git commit -m "Implement periodic framework-polyhedron-void descriptor"
+          git commit -m "Implement periodic framework-polyhedron-void descriptor core"
           git push origin "HEAD:${GITHUB_REF_NAME}"
