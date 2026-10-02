@@ -1,0 +1,56 @@
+name: bootstrap paper-5a4d4d payload v2
+run-name: "bootstrap-v2 paper-5a4d4d2640ecebb85628abb0 @ ${{ github.sha }}"
+
+on:
+  push:
+    branches:
+      - "impl/paper-5a4d4d2640ecebb85628abb0"
+    paths:
+      - ".github/workflows/bootstrap-paper-5a4d4d-v2.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out implementation branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Extract verified payload from transport file
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_file=.github/workflows/bootstrap-paper-5a4d4d2640ecebb85628abb0.yml
+          payload_b64="$RUNNER_TEMP/paper5a-payload.b64"
+          payload_tar="$RUNNER_TEMP/paper5a-payload.tar.xz"
+          SOURCE_FILE="$source_file" PAYLOAD_B64="$payload_b64" python - <<'PY'
+          import os
+          from pathlib import Path
+          text = Path(os.environ["SOURCE_FILE"]).read_text(encoding="utf-8")
+          marker = "<<'PAYLOAD'\n"
+          start = text.index(marker) + len(marker)
+          end = text.index("\nPAYLOAD\n", start)
+          payload = text[start:end].strip() + "\n"
+          Path(os.environ["PAYLOAD_B64"]).write_text(payload, encoding="ascii")
+          PY
+          base64 --decode "$payload_b64" > "$payload_tar"
+          echo "efeaa15a2b66f15f496f069a1ff8c1f18824433ded690bfba40d7b2035737711  $payload_tar" | sha256sum -c -
+          tar -tJf "$payload_tar" | tee "$RUNNER_TEMP/paper5a-manifest.txt"
+          if grep -Eq '(^/|(^|/)\.\.(/|$))' "$RUNNER_TEMP/paper5a-manifest.txt"; then
+            echo "unsafe archive path" >&2
+            exit 1
+          fi
+          tar -xJf "$payload_tar" -C "$GITHUB_WORKSPACE"
+          rm -f "$source_file" .github/workflows/bootstrap-paper-5a4d4d-v2.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Implement periodic framework-polyhedron-void descriptor"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
