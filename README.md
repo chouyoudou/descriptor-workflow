@@ -48,6 +48,7 @@ orthorhombic and skew cells.
 | Component | Purpose |
 | --- | --- |
 | [`crystal_geometry.py`](crystal_geometry.py) | Cell volume and volume per atom. |
+| [`descriptors/`](descriptors/) | Interpretable periodic-structure descriptors, including octahedral trans-pair deformation. |
 | [`restricted_exec.py`](restricted_exec.py) | Subprocess time limits and bounded output capture. |
 | [`public_env/`](public_env/) | Pinned dependencies and reusable Docker runtime caching. |
 | [`request_contract.py`](request_contract.py) | Validation of job requests and execution slots. |
@@ -66,16 +67,30 @@ client-supplied checksums are still checked. This avoids requiring callers to
 maintain a second copy of source identity while preserving exact-byte replay.
 Existing input pinning, resource limits and publication rules are unchanged.
 
+## Octahedral trans-pair example
+
+With NumPy installed, compute the static OTPD vector for a synthetic compressed
+NiN6 shell:
+
+```bash
+python3 -m descriptors.octahedral_trans_pair \
+  examples/POSCAR_otpd_compressed --center-element Ni --sites
+```
+
+The positive signed polarity denotes one isolated short geometrical trans pair.
+It is not a magnetic, electronic, energetic, or oxidation-state prediction.
+
 ## Tests
 
 From the repository root:
 
 ```bash
 python3 -m unittest discover -s tests -v
+python3 -m unittest -v descriptors.tests.test_octahedral_trans_pair
 ```
 
-The examples and tests exercise the utilities independently of any particular
-research dataset.
+The descriptor-specific test command requires NumPy. The examples and tests
+exercise the utilities independently of any particular research dataset.
 
 ## Project status
 
