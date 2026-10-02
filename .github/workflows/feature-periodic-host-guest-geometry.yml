@@ -49,6 +49,7 @@ jobs:
       - name: Run deterministic 1000-structure qualification
         env:
           PYTHONPATH: .
+          SOURCE_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 scripts/qualify_periodic_host_guest_geometry.py \
             --samples 1000 \
@@ -74,6 +75,9 @@ jobs:
           assert manifest["sample_success"] == 1000
           assert manifest["sample_fail"] == 0
           assert manifest["feature_id"] == "periodic-host-guest-geometry/1"
+          assert manifest["commit_sha"] == "${{ github.event.pull_request.head.sha || github.sha }}"
+          for relative in manifest["artifact_paths"]["evidence"]:
+              assert (root / relative).is_file(), relative
           with (root / "samples.csv").open(newline="", encoding="utf-8") as handle:
               reader = csv.DictReader(handle)
               rows = list(reader)
@@ -106,3 +110,4 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           overwrite: false
+          include-hidden-files: true

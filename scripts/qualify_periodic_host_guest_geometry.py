@@ -258,7 +258,9 @@ def main() -> int:
         "feature_id": FEATURE_ID,
         "research_id": "paper-721fa2a1b8b1b60dbf4da234",
         "descriptor_version": DESCRIPTOR_VERSION,
-        "commit_sha": os.environ.get("GITHUB_SHA", "local-development-only"),
+        "commit_sha": os.environ.get(
+            "SOURCE_COMMIT_SHA", os.environ.get("GITHUB_SHA", "local-development-only")
+        ),
         "seed": args.seed,
         "config": params,
         "sample_target": args.samples,
