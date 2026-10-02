@@ -6,7 +6,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ModuleNotFoundError as exc:  # Repository-wide tests intentionally install no extras.
+    raise unittest.SkipTest(
+        "site_environment_descriptor tests require the task-pinned NumPy runtime"
+    ) from exc
 
 from site_environment_descriptor import (
     FEATURE_NAMES,
