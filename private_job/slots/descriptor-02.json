@@ -1,5 +1,1 @@
-{
-  "job_id": "job-paper-3f39566c4f114df259269966-pcshape-v1-20261009a",
-  "task_descriptor": "transport/task_requests/paper-3f39566c4f114df259269966-pcshape-direct-v1.json",
-  "task_ref": "5301521dac82d531cf2acd08baf2fe7862ee8801"
-}
+{"version":3,"id":"paper-3f39566c4f114df259269966-pcshape-direct-v1","lane":"descriptor","slot":2}
