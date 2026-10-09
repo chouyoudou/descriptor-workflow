@@ -1,0 +1,117 @@
+name: impl paper-5a4d4d2640ecebb85628abb0
+run-name: "paper-5a4d4d2640ecebb85628abb0 @ ${{ github.sha }}"
+
+on:
+  push:
+    branches:
+      - "impl/paper-5a4d4d2640ecebb85628abb0"
+    paths:
+      - "phosphate_framework_descriptor/**"
+      - "tests/test_phosphate_framework_descriptor.py"
+      - "scripts/run_phosphate_framework_smoke.py"
+      - "docs/paper-5a4d4d2640ecebb85628abb0/**"
+      - "requirements-paper-5a4d4d2640ecebb85628abb0.txt"
+      - "THIRD_PARTY-paper-5a4d4d2640ecebb85628abb0.md"
+      - "LICENSE-paper-5a4d4d2640ecebb85628abb0.txt"
+      - "LICENSES/RDKit-BSD-3-Clause.txt"
+      - ".github/workflows/impl-paper-5a4d4d2640ecebb85628abb0.yml"
+  pull_request:
+    paths:
+      - "phosphate_framework_descriptor/**"
+      - "tests/test_phosphate_framework_descriptor.py"
+      - "scripts/run_phosphate_framework_smoke.py"
+      - "docs/paper-5a4d4d2640ecebb85628abb0/**"
+      - "requirements-paper-5a4d4d2640ecebb85628abb0.txt"
+      - "THIRD_PARTY-paper-5a4d4d2640ecebb85628abb0.md"
+      - "LICENSE-paper-5a4d4d2640ecebb85628abb0.txt"
+      - "LICENSES/RDKit-BSD-3-Clause.txt"
+      - ".github/workflows/impl-paper-5a4d4d2640ecebb85628abb0.yml"
+  workflow_dispatch:
+    inputs:
+      structures:
+        description: "Number of deterministic synthetic smoke structures"
+        required: false
+        default: "1000"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "impl-paper-5a4d4d2640ecebb85628abb0-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  test-and-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: .
+      ARTIFACT_DIR: artifacts/paper-5a4d4d2640ecebb85628abb0
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-paper-5a4d4d2640ecebb85628abb0.txt
+
+      - name: Install runtime dependency
+        run: python -m pip install --disable-pip-version-check -r requirements-paper-5a4d4d2640ecebb85628abb0.txt
+
+      - name: Compile implementation
+        run: python -m compileall -q phosphate_framework_descriptor scripts tests
+
+      - name: Unit and invariance tests
+        run: python -m unittest discover -s tests -p 'test_phosphate_framework_descriptor.py' -v
+
+      - name: Thousand-structure deterministic smoke
+        env:
+          N_STRUCTURES: ${{ inputs.structures || '1000' }}
+        run: |
+          python scripts/run_phosphate_framework_smoke.py \
+            --n "$N_STRUCTURES" \
+            --output-dir "$ARTIFACT_DIR"
+
+      - name: Publish compact job summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path(os.environ["ARTIFACT_DIR"]) / "smoke_summary.json"
+          out = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          if not path.exists():
+              out.write_text("## paper-5a4d4d2640ecebb85628abb0\n\nSmoke summary was not produced.\n", encoding="utf-8")
+              raise SystemExit(0)
+          data = json.loads(path.read_text(encoding="utf-8"))
+          lines = [
+              "## paper-5a4d4d2640ecebb85628abb0",
+              "",
+              "Periodic framework–polyhedron–void descriptor verification.",
+              "",
+              f"- structures: **{data['n_structures']}**",
+              f"- fixed features: **{data['n_features']}**",
+              f"- finite fraction: **{data['finite_fraction']:.6f}**",
+              f"- permutation max error: **{data['max_permutation_error']:.3e}**",
+              f"- translation max error: **{data['max_translation_error']:.3e}**",
+              f"- runtime: **{data['runtime_seconds']:.2f} s**",
+              "",
+              "> Structural smoke only; no catalytic, defect, processing, or macroscopic-porosity claim.",
+          ]
+          out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload reproducible smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "paper-5a4d4d2640ecebb85628abb0-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: |
+            artifacts/paper-5a4d4d2640ecebb85628abb0/feature_names.json
+            artifacts/paper-5a4d4d2640ecebb85628abb0/features.jsonl
+            artifacts/paper-5a4d4d2640ecebb85628abb0/smoke_summary.json
+          if-no-files-found: error
+          retention-days: 30
