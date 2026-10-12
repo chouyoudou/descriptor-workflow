@@ -5,31 +5,43 @@ Paper inspiration: Salmenjoki et al., *Scientific Reports* 13, 11114 (2023), DOI
 
 ## Scope
 
-`element_conditioned_local_geometry.py` defines the fixed schema
-`element-conditioned-local-geometry/1`: 30 deterministic scalars from one explicit,
-fully occupied periodic structure. The only elemental lookup is neutral-element
-atomic number. No experimental target, fitted parameter, EBSD map, grain label,
-dislocation density, strain history, force, energy, or learned representation is read.
+`element-conditioned-local-geometry/1` is a fixed vector of 30 deterministic scalars
+from one explicit, fully occupied periodic structure. The only elemental lookup is
+neutral-element atomic number. No experimental target, fitted parameter, EBSD map,
+grain label, dislocation density, strain history, force, energy, or learned
+representation is read.
 
-The paper motivates only a broad question: explicit chemical identity and local
-structural heterogeneity can be separated rather than collapsed into one global
-composition statistic. The implementation does **not** reproduce the paper's grain-
-level analysis or prediction problem. A POSCAR is not a polycrystalline EBSD map,
-and the descriptor is not a dislocation-density, deformation-history, strength, or
-ductility predictor.
+The paper motivates only the broad question of separating explicit chemical identity
+from local structural heterogeneity. This implementation does not reproduce the
+paper's grain-level analysis or prediction problem. A POSCAR is not a polycrystalline
+EBSD map, and this descriptor is not a dislocation-density, deformation-history,
+strength, or ductility predictor.
+
+The public module is split for auditability. `element_conditioned_local_geometry_base.py`
+contains the fixed science implementation. `element_conditioned_local_geometry.py`
+is the public facade; it installs the documented numerical-stability rules below and
+re-exports the fixed API. Both files are required and are part of the source identity.
 
 ## Periodic local shell
 
 For every crystallographic site, the code finds the 12 nearest periodic neighbours.
-If the 12th distance is degenerate, every neighbour tied within a fixed relative
-tolerance of `2e-8` is retained. This tie-complete shell avoids arbitrary deletion
-of symmetry-equivalent neighbours. It is a geometric neighbourhood, not a bond-order
-assignment.
+If the 12th distance is degenerate, every neighbour within
+
+```
+d_12 + max(1e-5 angstrom, 2e-8 * abs(d_12))
+```
+
+is retained. The absolute term is a representation-stability tolerance: it prevents
+micro-angstrom round-off in nearly symmetry-equivalent periodic images from selecting
+a different shell after rigid rotation, origin translation, site reordering, or
+integer-supercell replication. It is not a thermal broadening, bond uncertainty, or
+physical interaction range. The tie-complete shell is geometric rather than a
+bond-order assignment.
 
 The neighbour search starts from a density-scaled cutoff and expands to at most
 48 Å. It rejects overlapping periodic sites below 0.10 Å, singular cells, partial
 occupancy, non-neutral species labels, more than 4096 sites, more than 2,000,000
-periodic pairs, or more than 512 tied neighbours per site. Such cases return typed
+periodic pairs, or more than 512 tied neighbours per site. These cases return typed
 unavailability rather than imputed values.
 
 For site `s`, neighbour distances are `d_sj` and the geometric shell scale is
@@ -44,10 +56,10 @@ The scale-free radial residual is
 r_sj = log(d_sj) - mu_s,
 ```
 
-and the radial-disorder channel is `sqrt(mean_j(r_sj**2))`. The structure-level
-shell-scale heterogeneity uses `mu_s - mean_s(mu_s)`; therefore it is unchanged by
-uniform isotropic scaling. `knn_distance_mean_angstrom` is the deliberately retained
-absolute length channel and scales with the lattice.
+and radial disorder is `sqrt(mean_j(r_sj**2))`. Structure-level shell-scale
+heterogeneity uses `mu_s - mean_s(mu_s)` and is therefore unchanged by uniform
+isotropic scaling. `knn_distance_mean_angstrom` is the deliberately retained absolute
+length channel and scales with the lattice.
 
 ## Independent elemental contrast
 
@@ -58,14 +70,12 @@ c_sj = abs(Z_j - Z_s) / 117,
 ```
 
 where `Z` is neutral-element atomic number. The denominator is the largest possible
-atomic-number difference among elements 1--118. This lookup is a categorical
-chemical contrast, not oxidation state, charge transfer, valence, electronegativity,
-bond order, electronic structure, or a material response.
+atomic-number difference among elements 1--118. This is a categorical chemical
+contrast, not oxidation state, charge transfer, valence, electronegativity, bond
+order, electronic structure, or a material response.
 
-Two site channels are formed:
-
-- mean central-to-neighbour atomic-number contrast;
-- contrast--geometry coupling `mean_j(c_sj * abs(r_sj))`.
+Two site channels are formed: mean central-to-neighbour atomic-number contrast and
+contrast--geometry coupling `mean_j(c_sj * abs(r_sj))`.
 
 ## Element-conditioned decomposition
 
@@ -76,32 +86,32 @@ Four site quantities are analysed together:
 3. mean atomic-number contrast;
 4. contrast--radial coupling.
 
-For each quantity `y_s`, the code computes the mean for each central element and
-decomposes total site variance into a between-element component and a residual
-within-element component. The fixed `*_element_between_fraction` fields report
+For each quantity `y_s`, the code computes the mean for each central element and the
+usual between-element and total site variances. `*_element_between_fraction` reports
+`Var_between / Var_total` when the total variance exceeds `1e-24`. At or below that
+floor the ratio is set to zero because both numerator and denominator are numerical
+round-off around an exactly uniform site channel; interpreting their quotient would
+be unstable. The floor is not a physical threshold and does not zero the underlying
+site features.
 
-```
-Var_between / Var_total,
-```
-
-with zero returned when the total variance is exactly zero. These numbers state how
-much explicit site-to-site heterogeneity is aligned with the central element label.
-They do not identify a host, solute, defect, phase, or causal mechanism.
+These fractions state how much explicit site-to-site heterogeneity is aligned with
+the central element label. They do not identify a host, solute, defect, phase, or
+causal mechanism.
 
 The main compact candidate,
 `rarity_weighted_element_environment_contrast`, summarizes the Euclidean shift of
 element-conditioned means from the structure-wide mean. Each explicit site is
-weighted by central-element surprisal
+weighted by central-element surprisal,
 
 ```
 w_s proportional to -log(x_element(s)),
 ```
 
-where `x` is the global atomic fraction in that structure. The four componentwise
+where `x` is the global atomic fraction. The four componentwise
 `rarity_weighted_*_shift` fields expose the same quantity without vector collapse.
-For a monatomic structure, all these shifts are zero and rarity weighting is marked
-inactive. This weighting is minority-sensitive but is deliberately **not** called a
-solute score: stoichiometric minority sublattices receive the same treatment.
+For a monatomic structure all shifts are zero and rarity weighting is marked inactive.
+This weighting is minority-sensitive but deliberately is not called a solute score:
+stoichiometric minority sublattices receive the same treatment.
 
 A complementary family weights pairwise differences between element-conditioned
 means by
@@ -149,9 +159,9 @@ The ordered feature vector is:
 29. `within_element_environment_rms`
 30. `total_environment_heterogeneity_rms`
 
-All fixed feature values are finite when the row status is `ok`. Definition-domain
-or resource failures are returned separately; the implementation performs no zero
-fill for failed structures and no target-based imputation.
+Every fixed feature is finite when row status is `ok`. Definition-domain and resource
+failures are returned separately; failed structures are never zero-filled and there
+is no target-based imputation.
 
 ## Interfaces
 
@@ -161,24 +171,28 @@ Single POSCAR:
 python element_conditioned_local_geometry.py POSCAR --format poscar
 ```
 
-Frozen JSONL records:
+JSONL records:
 
 ```bash
 python element_conditioned_local_geometry.py structures.jsonl \
   --format jsonl --output descriptor.jsonl
 ```
 
-Every nonempty JSONL input line produces exactly one output row with `status: ok` or
-`status: unavailable`.
+Every nonempty JSONL input line produces exactly one `ok` or `unavailable` row.
 
 ## Cost and invariants
 
-For `N` sites and `E` element types, the post-neighbour operations are linear in the
-number of retained directed shell edges plus `O(E^2)` for pairwise element means.
-The neighbour search is bounded by explicit atom, pair, cutoff, and tied-shell limits.
-The feature vector is invariant to site order, origin translation, rigid rotation,
-and integer supercell replication. Uniform isotropic scaling changes only the one
-absolute distance channel.
+For `N` sites and `E` element types, post-neighbour work is linear in retained
+directed shell edges plus `O(E^2)` for element-pair means. Search cost is bounded by
+explicit atom, pair, cutoff, and tied-shell limits. The vector is invariant to site
+order, origin translation, rigid rotation, and integer-supercell replication within
+the declared numerical tolerance. Uniform isotropic scaling changes only the absolute
+distance channel.
+
+The frozen-development regression `dft_3d_JVASP-100493` is retained because it
+contains micro-angstrom near-degenerate shell distances and site-channel variances
+at round-off scale. It directly tests all four representation transformations rather
+than weakening the global invariance tolerance.
 
 ## Explicit non-claims
 
@@ -192,5 +206,5 @@ This static descriptor is not:
 - a learned network, property predictor, alloy selector, or process/component
   optimization method.
 
-Its scientific use is limited to describing chemistry-conditioned local geometry
-already explicit in the supplied periodic structure.
+Its scientific use is limited to chemistry-conditioned local geometry already
+explicit in the supplied periodic structure.
