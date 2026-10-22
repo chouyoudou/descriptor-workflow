@@ -1,0 +1,160 @@
+name: paper-7a2c33e site environment
+
+run-name: "paper-7a2c33e715c47a2c191a0574 @ ${{ github.sha }}"
+
+on:
+  push:
+    branches:
+      - "research/paper-7a2c33e715c47a2c191a0574"
+    paths:
+      - "site_environment_descriptor/**"
+      - "tests/test_site_environment_descriptor.py"
+      - "scripts/run_site_environment_smoke.py"
+      - "examples/site_environment_descriptor/**"
+      - "docs/paper-7a2c33e715c47a2c191a0574/**"
+      - "requirements-paper-7a2c33e715c47a2c191a0574.txt"
+      - "THIRD_PARTY-paper-7a2c33e715c47a2c191a0574.md"
+      - "LICENSE-paper-7a2c33e715c47a2c191a0574.txt"
+      - "LICENSES/RDKit-BSD-3-Clause.txt"
+      - ".github/workflows/paper-7a2c33e715c47a2c191a0574.yml"
+  pull_request:
+    paths:
+      - "site_environment_descriptor/**"
+      - "tests/test_site_environment_descriptor.py"
+      - "scripts/run_site_environment_smoke.py"
+      - "examples/site_environment_descriptor/**"
+      - "docs/paper-7a2c33e715c47a2c191a0574/**"
+      - "requirements-paper-7a2c33e715c47a2c191a0574.txt"
+      - "THIRD_PARTY-paper-7a2c33e715c47a2c191a0574.md"
+      - "LICENSE-paper-7a2c33e715c47a2c191a0574.txt"
+      - "LICENSES/RDKit-BSD-3-Clause.txt"
+      - ".github/workflows/paper-7a2c33e715c47a2c191a0574.yml"
+  workflow_dispatch:
+    inputs:
+      structures:
+        description: "Number of deterministic target-blind smoke structures"
+        required: false
+        default: "1000"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "paper-7a2c33e715c47a2c191a0574-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  test-and-thousand:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: .
+      ARTIFACT_DIR: artifacts/paper-7a2c33e715c47a2c191a0574
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-paper-7a2c33e715c47a2c191a0574.txt
+
+      - name: Install runtime dependency
+        run: python -m pip install --disable-pip-version-check -r requirements-paper-7a2c33e715c47a2c191a0574.txt
+
+      - name: Compile implementation
+        run: python -m compileall -q site_environment_descriptor scripts tests
+
+      - name: Unit, parser, scope, and invariance tests
+        run: python -m unittest discover -s tests -p 'test_site_environment_descriptor.py' -v
+
+      - name: Ordinary POSCAR and explicit-probe CLI check
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          python -m site_environment_descriptor.cli \
+            examples/site_environment_descriptor/POSCAR_LaO6 \
+            --probes Cr,Eu \
+            --output "$ARTIFACT_DIR/example_result.json"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("artifacts/paper-7a2c33e715c47a2c191a0574/example_result.json")
+          data = json.loads(p.read_text(encoding="utf-8"))
+          assert data["descriptor"]["schema"] == "periodic-site-environment/1"
+          assert data["explicit_probes"]["schema"] == "explicit-frozen-cage-probes/1"
+          assert len(data["descriptor"]["feature_names"]) == 94
+          PY
+
+      - name: Thousand-structure deterministic smoke
+        env:
+          N_STRUCTURES: ${{ inputs.structures || '1000' }}
+        run: |
+          python scripts/run_site_environment_smoke.py \
+            --n "$N_STRUCTURES" \
+            --output-dir "$ARTIFACT_DIR"
+
+      - name: Create evidence checksums
+        if: always()
+        run: |
+          if test -d "$ARTIFACT_DIR"; then
+            (
+              cd "$ARTIFACT_DIR"
+              sha256sum feature_names.json features.jsonl smoke_summary.json example_result.json \
+                > SHA256SUMS.txt
+            )
+          fi
+
+      - name: Publish compact job summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          path = Path(os.environ["ARTIFACT_DIR"]) / "smoke_summary.json"
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          if not path.exists():
+              out.write_text(
+                  "## paper-7a2c33e715c47a2c191a0574\n\n"
+                  "Smoke summary was not produced.\n",
+                  encoding="utf-8",
+              )
+              raise SystemExit(0)
+          data = json.loads(path.read_text(encoding="utf-8"))
+          lines = [
+              "## paper-7a2c33e715c47a2c191a0574",
+              "",
+              "Periodic site-environment and explicit frozen-cage geometry verification.",
+              "",
+              f"- structures: **{data['n_structures']}**",
+              f"- fixed features: **{data['n_features']}**",
+              f"- defined fraction: **{data['defined_fraction']:.6f}**",
+              f"- columns represented: **{data['columns_with_any_defined_value']}**",
+              f"- permutation max error: **{data['max_permutation_error']:.3e}**",
+              f"- translation max error: **{data['max_translation_error']:.3e}**",
+              f"- rotation max error: **{data['max_rotation_error']:.3e}**",
+              f"- supercell max error: **{data['max_supercell_error']:.3e}**",
+              f"- runtime: **{data['runtime_seconds']:.2f} s**",
+              f"- rows SHA-256: `{data['rows_sha256']}`",
+              "",
+              "> Static, target-blind structural verification only; no valence, dopant occupancy/site, response, energy, or synthesis claim.",
+          ]
+          out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload reproducible evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "paper-7a2c33e715c47a2c191a0574-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: |
+            artifacts/paper-7a2c33e715c47a2c191a0574/feature_names.json
+            artifacts/paper-7a2c33e715c47a2c191a0574/features.jsonl
+            artifacts/paper-7a2c33e715c47a2c191a0574/smoke_summary.json
+            artifacts/paper-7a2c33e715c47a2c191a0574/example_result.json
+            artifacts/paper-7a2c33e715c47a2c191a0574/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
