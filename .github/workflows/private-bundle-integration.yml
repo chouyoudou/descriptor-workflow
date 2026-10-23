@@ -19,6 +19,7 @@ jobs:
     outputs:
       ok: ${{ steps.resolve.outputs.ok }}
       bundle_id: ${{ steps.resolve.outputs.bundle_id }}
+      private_repository: ${{ steps.repository.outputs.name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -26,6 +27,19 @@ jobs:
       - name: Resolve opaque owner-only bundle trigger
         id: resolve
         run: python3 bundle_ingress.py resolve --event "$GITHUB_EVENT_PATH"
+      - name: Choose the private repository for this bundle
+        id: repository
+        env:
+          BUNDLE_ID: ${{ steps.resolve.outputs.bundle_id }}
+          RUNS_REPOSITORY: ${{ vars.RUNS_REPOSITORY }}
+        run: |
+          # Ids of the form bt-r<12 hex> use RUNS_REPOSITORY when that variable is set;
+          # every other id keeps using the archive repository above.
+          if [ -n "$RUNS_REPOSITORY" ] && [[ "$BUNDLE_ID" =~ ^bt-r[0-9a-f]{12}$ ]]; then
+            echo "name=$RUNS_REPOSITORY" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=$PRIVATE_REPOSITORY" >> "$GITHUB_OUTPUT"
+          fi
 
   integrate:
     needs: resolve
@@ -35,6 +49,8 @@ jobs:
     concurrency:
       group: private-bundle-${{ needs.resolve.outputs.bundle_id }}
       cancel-in-progress: false
+    env:
+      PRIVATE_REPOSITORY: ${{ needs.resolve.outputs.private_repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
