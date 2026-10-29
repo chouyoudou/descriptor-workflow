@@ -56,6 +56,12 @@ jobs:
         with:
           persist-credentials: false
 
+      # Several bundles are opened together; their admissions write to the same private repository and
+      # collide when they start in the same seconds. Spreading the start here keeps the sender from
+      # having to wait between issues on its own (billed) runner.
+      - name: Spread admissions of bundles opened together
+        run: sleep $((RANDOM % 300))
+
       - name: Recover prior result or admit a new execution
         id: materialize
         env:
