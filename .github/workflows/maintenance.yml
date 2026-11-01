@@ -7,7 +7,8 @@ on:
   schedule:
     - cron: "23 * * * *"  # a loop lasts about 5.5 hours; the next run waits for it (concurrency below)
   workflow_dispatch:
-permissions: {}
+permissions:
+  actions: write  # only for the two calls in the last step: start the next run, keep the schedule on
 concurrency:
   group: maintenance
   cancel-in-progress: false
@@ -23,6 +24,7 @@ jobs:
           LAB_REPO: ${{ secrets.LAB_REPO }}
         run: |
           exec >/dev/null 2>&1
+          echo "LOOP_START=$(date +%s)" >> "$GITHUB_ENV"
           [ -n "$LAB_TOKEN" ] || exit 0
           repo="$LAB_REPO"
           if [ -z "$repo" ]; then
@@ -33,3 +35,17 @@ jobs:
           [ -n "$repo" ] || exit 1
           git clone -q --filter=blob:none "https://x-access-token:${LAB_TOKEN}@github.com/${repo}.git" "$RUNNER_TEMP/lab" || exit 1
           bash "$RUNNER_TEMP/lab/tools/tick_loop.sh"
+      - name: next
+        # Start the next loop with this run's own token. The owner's token may not carry Actions: write, and on
+        # 11-01 the first loop ended at 13:59 without a successor; the hourly schedule had not fired once.
+        # A workflow_dispatch from GITHUB_TOKEN does start a run; the concurrency group above keeps one waiting.
+        if: success() || failure()  # not when cancelled: cancelling a run stops the chain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          exec >/dev/null 2>&1
+          # A loop that died at once (no token, clone refused) retries every 15 minutes, never in a tight circle.
+          left=$(( ${LOOP_START:-0} + 900 - $(date +%s) ))
+          [ "$left" -le 0 ] || sleep "$left"
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/maintenance.yml/enable" || true
+          gh api -X POST "repos/$GITHUB_REPOSITORY/actions/workflows/maintenance.yml/dispatches" -f ref="$GITHUB_REF_NAME" || true
